@@ -161,20 +161,38 @@ def save_config(cfg):
         json.dump(cfg, f, indent=4)
 
 
+def normalize_cookies(raw):
+    """Accept both formats:
+    - Cookie-Editor export: [{"name":"x","value":"y",...}, ...]
+    - Simple dict: {"name": "value", ...}
+    Returns simple {name: value} dict.
+    """
+    if isinstance(raw, list):
+        # Cookie-Editor / browser extension format
+        return {c["name"]: c["value"] for c in raw if "name" in c and "value" in c}
+    if isinstance(raw, dict):
+        return raw
+    return {}
+
+
 def load_cookies(suffix=""):
-    """Load cookies from env var or file. suffix="" for main, "_2", "_3" etc for extra accounts."""
+    """Load cookies from env var or file. suffix="" for main, "_2", "_3" etc for extra accounts.
+    Accepts both Cookie-Editor array format and simple {name:value} dict.
+    """
     env_key = f"SESSION_COOKIES{suffix}"
     env_cookies = os.environ.get(env_key, "")
     if env_cookies:
         try:
-            cookies = json.loads(env_cookies)
+            raw = json.loads(env_cookies)
+            cookies = normalize_cookies(raw)
             cprint("OK", f"Loaded {len(cookies)} cookies from {env_key}")
             return cookies
         except json.JSONDecodeError:
             cprint("!!", f"{env_key} env var is not valid JSON")
     if not suffix and COOKIE_PATH.exists():
         with open(COOKIE_PATH, "r") as f:
-            cookies = json.load(f)
+            raw = json.load(f)
+        cookies = normalize_cookies(raw)
         cprint("OK", f"Loaded {len(cookies)} cookies from cookies.json")
         return cookies
     if not suffix:
