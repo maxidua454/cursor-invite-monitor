@@ -202,7 +202,7 @@ def safe_reconnect(driver, wait=8):
 
 
 def solve_cloudflare(driver, context="page"):
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             is_cf = driver.execute_script("""
                 return document.title.includes('Just a moment')
@@ -215,7 +215,22 @@ def solve_cloudflare(driver, context="page"):
             if not is_cf:
                 return True
 
-            cprint(Fore.YELLOW, "CF", f"{context} (attempt {attempt+1}/3)")
+            cprint(Fore.YELLOW, "CF", f"{context} (attempt {attempt+1}/5)")
+
+            # Method 1: Try uc_gui_click_captcha (clicks Turnstile checkbox)
+            try:
+                driver.uc_gui_click_captcha()
+                time.sleep(3)
+                still = driver.execute_script(
+                    "return document.title.includes('Just a moment');"
+                )
+                if not still:
+                    cprint(Fore.GREEN, "OK", "CF bypassed via uc_gui_click!")
+                    return True
+            except Exception as e:
+                cprint(Fore.YELLOW, "..", f"uc_gui_click: {str(e)[:40]}")
+
+            # Method 2: reconnect trick
             safe_reconnect(driver, 8)
             time.sleep(1)
 
@@ -236,8 +251,23 @@ def solve_cloudflare(driver, context="page"):
                 cprint(Fore.GREEN, "OK", "Turnstile solved!")
                 return True
 
+            # Method 3: Try clicking the iframe checkbox directly
+            try:
+                driver.execute_script("""
+                    var frames = document.querySelectorAll('iframe');
+                    for (var f of frames) {
+                        if (f.src && f.src.includes('turnstile')) {
+                            f.click();
+                        }
+                    }
+                """)
+                time.sleep(2)
+            except Exception:
+                pass
+
+            # Method 4: longer reconnect
             safe_reconnect(driver, 12)
-            time.sleep(1)
+            time.sleep(2)
         except Exception as e:
             cprint(Fore.YELLOW, "..", f"CF error: {str(e)[:50]}")
             time.sleep(1)
@@ -401,17 +431,21 @@ def login_to_cursor(driver, email, password):
             time.sleep(1)
 
         try:
-            src = driver.get_page_source().lower()
             final_url = driver.current_url
-            if "incorrect" in src or "invalid" in src:
-                cprint(Fore.RED, "!!", "Wrong credentials!")
-                monitor_status["last_error"] = "Wrong credentials"
+            src = driver.get_page_source().lower()
+            title = driver.execute_script("return document.title;") or ""
+            body_text = (driver.execute_script("return document.body.innerText;") or "")[:300]
+            cprint(Fore.RED, "!!", f"Login timeout | URL: {final_url[:60]} | Title: {title}")
+            cprint(Fore.RED, "!!", f"Body preview: {body_text[:150]}")
+            if ("incorrect" in src or "invalid" in src) and "just a moment" not in src:
+                cprint(Fore.RED, "!!", "Wrong credentials detected in page!")
+                monitor_status["last_error"] = f"Wrong credentials | {title}"
                 return False
         except Exception:
             final_url = "unknown"
 
         cprint(Fore.RED, "!!", f"Login timeout at {final_url[:60]}")
-        monitor_status["last_error"] = f"Login timeout at {final_url[:60]}"
+        monitor_status["last_error"] = f"Timeout at {final_url[:60]}"
         return False
     except Exception as e:
         cprint(Fore.RED, "!!", f"Login error: {e}")
