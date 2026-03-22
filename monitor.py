@@ -331,6 +331,51 @@ class CursorHTTP:
             cprint("!!", f"Invite API error: {str(e)[:60]}")
             return None, "error"
 
+    def join_with_invite_link(self, invite_link):
+        """Accept an invite link to rejoin the team. Returns (success, detail)."""
+        if not invite_link:
+            return False, "no_link"
+        try:
+            cprint(">>", f"Attempting to join: {invite_link}")
+            resp = self.session.get(invite_link, timeout=15, allow_redirects=True)
+            final_url = resp.url
+            status = resp.status_code
+            text = resp.text[:500]
+            cprint(">>", f"Join response: HTTP {status} → {final_url}")
+
+            if status == 200 and ("dashboard" in final_url or "Team Plan" in text):
+                cprint("OK", "REJOIN SUCCESSFUL via GET redirect!")
+                return True, "joined_via_get"
+
+            # Some invite flows need a POST/accept action
+            # Try POST to accept-invite endpoint
+            resp2 = self.session.post(
+                invite_link,
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Referer": invite_link,
+                    "Origin": "https://cursor.com",
+                },
+                json={},
+                timeout=15,
+            )
+            cprint(">>", f"Join POST response: HTTP {resp2.status_code}")
+            if resp2.status_code == 200:
+                cprint("OK", "REJOIN SUCCESSFUL via POST!")
+                return True, "joined_via_post"
+
+            # Check if we're back on the team by testing the API
+            link, api_status = self.get_invite_link_via_api()
+            if link:
+                cprint("OK", "REJOIN CONFIRMED — invite API works again!")
+                return True, "confirmed_via_api"
+
+            return False, f"http_{status}"
+        except Exception as e:
+            cprint("!!", f"Join error: {str(e)[:60]}")
+            return False, str(e)[:60]
+
 
 # ============================================================
 # EMAIL
@@ -600,8 +645,7 @@ def monitor_account(account, cfg, cookies):
     check_count = 0
     consecutive_errors = 0
     last_session_check = time.time()
-    last_team_check = time.time()
-    removed_notified = False
+    rejoin_attempts = 0
 
     cprint("OK", "Monitoring started!")
     cprint(">>", f"Known link: {known_link or 'none'}")
@@ -611,7 +655,7 @@ def monitor_account(account, cfg, cookies):
         check_count += 1
 
         try:
-            # Periodic session validity check (every 2 min)
+            # ── SESSION CHECK (every 2 min) ──
             if time.time() - last_session_check > 120:
                 valid, detail = http.check_session()
                 last_session_check = time.time()
@@ -623,9 +667,15 @@ def monitor_account(account, cfg, cookies):
                     send_email(cfg, f"SESSION EXPIRED - {name}",
                         "<h2>Session Expired!</h2>"
                         "<p>Your Cursor session cookies have expired.</p>"
-                        "<p>To fix: log into cursor.com, extract cookies, "
-                        "update SESSION_COOKIES env var on Render, and redeploy.</p>")
-                    # Wait for new cookies
+                        "<h3>How to fix:</h3>"
+                        "<ol>"
+                        "<li>Open <b>cursor.com</b> in your browser and log in</li>"
+                        "<li>Use a cookie extension (EditThisCookie / Cookie-Editor) to export all cookies as JSON</li>"
+                        "<li>Go to <a href='https://dashboard.render.com'>Render Dashboard</a> → cursor-invite-monitor → Environment</li>"
+                        "<li>Update <b>SESSION_COOKIES</b> with the new cookie JSON (compact, one line)</li>"
+                        "<li>Click <b>Save Changes</b> — Render will auto-redeploy</li>"
+                        "</ol>")
+                    # Keep checking every 60s for updated cookies
                     while True:
                         time.sleep(60)
                         new_cookies = load_cookies()
@@ -642,45 +692,71 @@ def monitor_account(account, cfg, cookies):
                                 break
                     continue
 
-            # Periodic team membership check (every 5 min)
-            if time.time() - last_team_check > 300:
-                team_status, team_detail = http.get_team_status()
-                last_team_check = time.time()
-                if team_status in ("removed", "free_plan", "logged_out"):
-                    cprint("!!", f"TEAM STATUS: {team_status} ({team_detail})")
-                    monitor_status["status"] = f"team_{team_status}"
-                    monitor_status["last_error"] = f"Team: {team_status} — {team_detail}"
-                    if not removed_notified:
-                        removed_notified = True
-                        send_email(cfg, f"REMOVED FROM TEAM - {name}",
-                            f"<h2>You may have been removed from the team!</h2>"
-                            f"<p>Status: {team_status}</p>"
-                            f"<p>Detail: {team_detail}</p>"
-                            f"<p>Check your Cursor dashboard immediately.</p>")
-                elif team_status == "active":
-                    if removed_notified:
-                        cprint("OK", "Back on team!")
-                        removed_notified = False
-                        monitor_status["status"] = "running"
-                        send_email(cfg, f"BACK ON TEAM - {name}",
-                            f"<h2>Team membership restored!</h2>"
-                            f"<p>Detail: {team_detail}</p>")
-
-            # Get invite link (API first, HTML fallback)
+            # ── GET INVITE LINK (primary check every cycle) ──
             new_link, api_status = http.get_invite_link_via_api()
+
             if api_status == "unauthorized":
-                # Session expired or removed from team — force re-check
-                monitor_status["status"] = "session_expired"
-                monitor_status["session_valid"] = False
-                last_session_check = 0
-                last_team_check = 0  # Also re-check team status
+                # ── REMOVED FROM TEAM — INSTANT REJOIN ──
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                cprint("!!", "=" * 50)
+                cprint("!!", f"REMOVED FROM TEAM DETECTED at {now}")
+                cprint("!!", "=" * 50)
+                monitor_status["status"] = "removed_rejoining"
+                monitor_status["last_error"] = f"Removed at {now}, auto-rejoining..."
+
+                rejoin_link = known_link
+                if not rejoin_link:
+                    cprint("!!", "NO KNOWN INVITE LINK — cannot auto-rejoin!")
+                    send_email(cfg, f"REMOVED - NO INVITE LINK - {name}",
+                        f"<h2>Removed from team but no invite link to rejoin!</h2>"
+                        f"<p>Time: {now}</p>")
+                    # Fall through to keep monitoring
+                else:
+                    # Try to rejoin IMMEDIATELY
+                    rejoin_attempts = 0
+                    max_rejoin_attempts = 30
+                    while rejoin_attempts < max_rejoin_attempts:
+                        rejoin_attempts += 1
+                        cprint(">>", f"Rejoin attempt #{rejoin_attempts}...")
+                        success, detail = http.join_with_invite_link(rejoin_link)
+                        if success:
+                            rejoin_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                            cprint("OK", "=" * 50)
+                            cprint("OK", f"REJOINED TEAM at {rejoin_time}!")
+                            cprint("OK", f"Method: {detail}")
+                            cprint("OK", "=" * 50)
+                            monitor_status["status"] = "running"
+                            monitor_status["last_error"] = f"Rejoined at {rejoin_time} ({detail})"
+                            send_email(cfg, f"REJOINED TEAM - {name}",
+                                f"<h2>Auto-Rejoined Team!</h2>"
+                                f"<table border='1' cellpadding='8'>"
+                                f"<tr><td><b>Removed at</b></td><td>{now}</td></tr>"
+                                f"<tr><td><b>Rejoined at</b></td><td>{rejoin_time}</td></tr>"
+                                f"<tr><td><b>Method</b></td><td>{detail}</td></tr>"
+                                f"<tr><td><b>Attempt</b></td><td>#{rejoin_attempts}</td></tr>"
+                                f"<tr><td><b>Link used</b></td><td>{rejoin_link}</td></tr>"
+                                f"</table>")
+                            break
+                        # Wait briefly before retry
+                        time.sleep(2)
+
+                    if rejoin_attempts >= max_rejoin_attempts:
+                        cprint("!!", f"REJOIN FAILED after {max_rejoin_attempts} attempts!")
+                        monitor_status["status"] = "rejoin_failed"
+                        monitor_status["last_error"] = f"Rejoin failed after {max_rejoin_attempts} attempts"
+                        send_email(cfg, f"REJOIN FAILED - {name}",
+                            f"<h2>Auto-Rejoin Failed!</h2>"
+                            f"<p>Removed at: {now}</p>"
+                            f"<p>Tried {max_rejoin_attempts} times with link:</p>"
+                            f"<p>{rejoin_link}</p>"
+                            f"<p><b>The invite link may have been revoked.</b></p>"
+                            f"<p>Get a new invite link and update KNOWN_INVITE_LINK env var.</p>")
                 continue
+
             if not new_link:
                 new_link, code = http.get_invite_link()
                 if code == 401:
-                    monitor_status["status"] = "session_expired"
-                    monitor_status["session_valid"] = False
-                    last_session_check = 0
+                    last_session_check = 0  # Force session check next cycle
                     continue
 
             monitor_status["last_check"] = datetime.now().isoformat()
