@@ -1,5 +1,5 @@
 """
-CURSOR INVITE LINK MONITOR v5
+CURSOR INVITE LINK MONITOR v6
 - SeleniumBase UC mode with Xvfb virtual display in Docker
 - Cloudflare/Turnstile bypass via reconnect trick
 - Multi-account support
@@ -540,31 +540,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="10">
 <style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:20px}
-h1{color:#58a6ff;margin-bottom:20px;font-size:24px}
-.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}
-.card h2{color:#8b949e;font-size:14px;text-transform:uppercase;margin-bottom:12px}
-.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
-.stat{background:#21262d;border-radius:8px;padding:16px;text-align:center}
-.stat .val{font-size:28px;font-weight:bold;color:#58a6ff}
-.stat .label{font-size:12px;color:#8b949e;margin-top:4px}
-.stat.ok .val{color:#3fb950}
-.stat.warn .val{color:#d29922}
-.stat.err .val{color:#f85149}
-.link-box{background:#21262d;border-radius:8px;padding:16px;margin-top:12px;word-break:break-all}
-.link-box a{color:#58a6ff;text-decoration:none;font-size:16px}
-.link-box a:hover{text-decoration:underline}
-.link-box .time{color:#8b949e;font-size:12px;margin-top:4px}
-table{width:100%;border-collapse:collapse;margin-top:12px}
-th{text-align:left;color:#8b949e;font-size:12px;padding:8px;border-bottom:1px solid #30363d}
-td{padding:8px;border-bottom:1px solid #21262d;font-size:13px}
-td a{color:#58a6ff;text-decoration:none}
-.badge{display:inline-block;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:600}
-.badge.running{background:#0d2818;color:#3fb950}
-.badge.starting{background:#2d2200;color:#d29922}
-.badge.error{background:#2d0f0f;color:#f85149}
-.badge.login{background:#1a1a3e;color:#bc8cff}
+*{{margin:0;padding:0;box-sizing:border-box}}
+body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:20px}}
+h1{{color:#58a6ff;margin-bottom:20px;font-size:24px}}
+.card{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}}
+.card h2{{color:#8b949e;font-size:14px;text-transform:uppercase;margin-bottom:12px}}
+.stat-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}}
+.stat{{background:#21262d;border-radius:8px;padding:16px;text-align:center}}
+.stat .val{{font-size:28px;font-weight:bold;color:#58a6ff}}
+.stat .label{{font-size:12px;color:#8b949e;margin-top:4px}}
+.stat.ok .val{{color:#3fb950}}
+.stat.warn .val{{color:#d29922}}
+.stat.err .val{{color:#f85149}}
+.link-box{{background:#21262d;border-radius:8px;padding:16px;margin-top:12px;word-break:break-all}}
+.link-box a{{color:#58a6ff;text-decoration:none;font-size:16px}}
+.link-box a:hover{{text-decoration:underline}}
+.link-box .time{{color:#8b949e;font-size:12px;margin-top:4px}}
+table{{width:100%;border-collapse:collapse;margin-top:12px}}
+th{{text-align:left;color:#8b949e;font-size:12px;padding:8px;border-bottom:1px solid #30363d}}
+td{{padding:8px;border-bottom:1px solid #21262d;font-size:13px}}
+td a{{color:#58a6ff;text-decoration:none}}
+.badge{{display:inline-block;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:600}}
+.badge.running{{background:#0d2818;color:#3fb950}}
+.badge.starting{{background:#2d2200;color:#d29922}}
+.badge.error{{background:#2d0f0f;color:#f85149}}
+.badge.login{{background:#1a1a3e;color:#bc8cff}}
 </style></head><body>
 <h1>Cursor Invite Link Monitor</h1>
 
@@ -616,59 +616,62 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
+            try:
+                s = monitor_status
+                status_text = s["status"]
+                if "running" in status_text:
+                    badge = '<span class="badge running">RUNNING</span>'
+                elif "login" in status_text:
+                    badge = f'<span class="badge login">{status_text}</span>'
+                elif "error" in status_text or "fail" in status_text:
+                    badge = f'<span class="badge error">{status_text}</span>'
+                else:
+                    badge = f'<span class="badge starting">{status_text}</span>'
 
-            s = monitor_status
-            status_text = s["status"]
-            if "running" in status_text:
-                badge = '<span class="badge running">RUNNING</span>'
-            elif "login" in status_text:
-                badge = f'<span class="badge login">{status_text}</span>'
-            elif "error" in status_text or "fail" in status_text:
-                badge = f'<span class="badge error">{status_text}</span>'
-            else:
-                badge = f'<span class="badge starting">{status_text}</span>'
+                link = s.get("current_link", "")
+                if link:
+                    link_html = f'<a href="{link}">{link}</a>'
+                else:
+                    link_html = '<span style="color:#8b949e">Not yet extracted...</span>'
 
-            link = s.get("current_link", "")
-            if link:
-                link_html = f'<a href="{link}">{link}</a>'
-            else:
-                link_html = '<span style="color:#8b949e">Not yet extracted...</span>'
+                last_check = s.get("last_check", "Never")
+                if last_check and last_check != "Never":
+                    last_check = last_check[:19].replace("T", " ")
 
-            last_check = s.get("last_check", "Never")
-            if last_check and last_check != "Never":
-                last_check = last_check[:19].replace("T", " ")
+                # History table
+                history = link_history_log[-20:]
+                if history:
+                    rows = ""
+                    for h in reversed(history):
+                        ts = h.get("time", "")[:19]
+                        old = h.get("old", "")
+                        new = h.get("new", "")
+                        rows += f'<tr><td>{ts}</td><td><a href="{old}">{old[-20:]}</a></td><td><a href="{new}">{new[-20:]}</a></td></tr>'
+                    hist_html = f'<table><tr><th>Time</th><th>Old Link</th><th>New Link</th></tr>{rows}</table>'
+                else:
+                    hist_html = '<p style="color:#8b949e;padding:12px">No changes detected yet</p>'
 
-            # History table
-            history = link_history_log[-20:]
-            if history:
-                rows = ""
-                for h in reversed(history):
-                    ts = h.get("time", "")[:19]
-                    old = h.get("old", "")
-                    new = h.get("new", "")
-                    rows += f'<tr><td>{ts}</td><td><a href="{old}">{old[-20:]}</a></td><td><a href="{new}">{new[-20:]}</a></td></tr>'
-                hist_html = f'<table><tr><th>Time</th><th>Old Link</th><th>New Link</th></tr>{rows}</table>'
-            else:
-                hist_html = '<p style="color:#8b949e;padding:12px">No changes detected yet</p>'
+                started = (s.get("started") or "")[:19].replace("T", " ")
+                last_err = s.get("last_error", "None")
+                last_err_short = (last_err[:50] + "...") if len(last_err) > 50 else last_err
 
-            started = (s.get("started") or "")[:19].replace("T", " ")
-            last_err = s.get("last_error", "None")
-            last_err_short = (last_err[:50] + "...") if len(last_err) > 50 else last_err
-
-            html = DASHBOARD_HTML.format(
-                status_badge=badge,
-                checks=s["checks"],
-                link_changes=s["link_changes"],
-                changes_class="warn" if s["link_changes"] > 0 else "",
-                errors=s["errors"],
-                err_class="err" if s["errors"] > 0 else "",
-                current_link_html=link_html,
-                last_check=last_check,
-                history_html=hist_html,
-                started=started,
-                last_error_short=last_err_short,
-            )
-            self.wfile.write(html.encode())
+                html = DASHBOARD_HTML.format(
+                    status_badge=badge,
+                    checks=s["checks"],
+                    link_changes=s["link_changes"],
+                    changes_class="warn" if s["link_changes"] > 0 else "",
+                    errors=s["errors"],
+                    err_class="err" if s["errors"] > 0 else "",
+                    current_link_html=link_html,
+                    last_check=last_check,
+                    history_html=hist_html,
+                    started=started,
+                    last_error_short=last_err_short,
+                )
+                self.wfile.write(html.encode())
+            except Exception as e:
+                err_html = f'<html><body style="background:#0d1117;color:#f85149;padding:40px;font-family:monospace"><h1>Dashboard Error</h1><pre>{e}</pre></body></html>'
+                self.wfile.write(err_html.encode())
 
     def log_message(self, *a):
         pass
@@ -857,7 +860,7 @@ def monitor_account(account, cfg):
 
 def main():
     print(f"\n{Fore.CYAN}{'='*60}")
-    print(f"{Fore.CYAN}  CURSOR INVITE LINK MONITOR v5")
+    print(f"{Fore.CYAN}  CURSOR INVITE LINK MONITOR v6")
     print(f"{Fore.CYAN}  SeleniumBase UC | Xvfb Docker | Auto-Rejoin")
     print(f"{Fore.CYAN}{'='*60}\n")
 
