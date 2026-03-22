@@ -1,8 +1,9 @@
 # Deploy to Render.com
-# 1. Push this repo to GitHub
-# 2. Go to render.com → New → Web Service
-# 3. Connect your GitHub repo
-# 4. Set SESSION_COOKIES env var with your cookies JSON
+# Supports multiple accounts via env vars:
+#   Account 1: SESSION_COOKIES, ACCOUNT_NAME, KNOWN_INVITE_LINK
+#   Account 2: SESSION_COOKIES_2, ACCOUNT_NAME_2, KNOWN_INVITE_LINK_2
+#   Account 3: SESSION_COOKIES_3, ACCOUNT_NAME_3, KNOWN_INVITE_LINK_3
+#   ...up to 10 accounts
 
 services:
   - type: web
@@ -14,15 +15,24 @@ services:
         value: "1"
       - key: PORT
         value: "10000"
+      - key: CHECK_INTERVAL
+        value: "1"
+      # Account 1
       - key: SESSION_COOKIES
         sync: false
-      - key: NOTIFICATION_EMAIL
-        sync: false
-      - key: GMAIL_APP_PASSWORD
-        sync: false
-      - key: CHECK_INTERVAL
-        value: "5"
       - key: ACCOUNT_NAME
         value: "Adrian Max - Hanwha Team"
       - key: KNOWN_INVITE_LINK
+        sync: false
+      # Account 2 (add more as needed)
+      - key: SESSION_COOKIES_2
+        sync: false
+      - key: ACCOUNT_NAME_2
+        sync: false
+      - key: KNOWN_INVITE_LINK_2
+        sync: false
+      # Email notifications
+      - key: NOTIFICATION_EMAIL
+        sync: false
+      - key: GMAIL_APP_PASSWORD
         sync: false

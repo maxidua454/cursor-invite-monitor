@@ -161,27 +161,66 @@ def save_config(cfg):
         json.dump(cfg, f, indent=4)
 
 
-def load_cookies():
-    env_cookies = os.environ.get("SESSION_COOKIES", "")
+def load_cookies(suffix=""):
+    """Load cookies from env var or file. suffix="" for main, "_2", "_3" etc for extra accounts."""
+    env_key = f"SESSION_COOKIES{suffix}"
+    env_cookies = os.environ.get(env_key, "")
     if env_cookies:
         try:
             cookies = json.loads(env_cookies)
-            cprint("OK", f"Loaded {len(cookies)} cookies from env var")
+            cprint("OK", f"Loaded {len(cookies)} cookies from {env_key}")
             return cookies
         except json.JSONDecodeError:
-            cprint("!!", "SESSION_COOKIES env var is not valid JSON")
-    if COOKIE_PATH.exists():
+            cprint("!!", f"{env_key} env var is not valid JSON")
+    if not suffix and COOKIE_PATH.exists():
         with open(COOKIE_PATH, "r") as f:
             cookies = json.load(f)
         cprint("OK", f"Loaded {len(cookies)} cookies from cookies.json")
         return cookies
-    cprint("!!", "No cookies found!")
+    if not suffix:
+        cprint("!!", "No cookies found!")
     return {}
 
 
 def save_cookies(cookies):
     with open(COOKIE_PATH, "w") as f:
         json.dump(cookies, f, indent=2)
+
+
+def discover_accounts():
+    """Auto-discover accounts from env vars.
+    Account 1: SESSION_COOKIES, ACCOUNT_NAME, KNOWN_INVITE_LINK
+    Account 2: SESSION_COOKIES_2, ACCOUNT_NAME_2, KNOWN_INVITE_LINK_2
+    Account 3: SESSION_COOKIES_3, ACCOUNT_NAME_3, KNOWN_INVITE_LINK_3
+    ...up to 10 accounts.
+    """
+    accounts = []
+
+    # Account 1 (main)
+    cookies = load_cookies()
+    if cookies:
+        accounts.append({
+            "name": os.environ.get("ACCOUNT_NAME", "Account 1"),
+            "known_invite_link": os.environ.get("KNOWN_INVITE_LINK", ""),
+            "cookies": cookies,
+            "suffix": "",
+            "enabled": True,
+        })
+
+    # Accounts 2-10
+    for i in range(2, 11):
+        suffix = f"_{i}"
+        cookies = load_cookies(suffix)
+        if cookies:
+            accounts.append({
+                "name": os.environ.get(f"ACCOUNT_NAME{suffix}", f"Account {i}"),
+                "known_invite_link": os.environ.get(f"KNOWN_INVITE_LINK{suffix}", ""),
+                "cookies": cookies,
+                "suffix": suffix,
+                "enabled": True,
+            })
+
+    return accounts
 
 
 def load_history():
@@ -358,6 +397,9 @@ monitor_status = {
     "errors": 0, "last_error": "", "session_valid": False,
     "removals": 0, "rejoins": 0, "last_response_ms": 0,
 }
+# Per-account status: account_statuses["Account 1"] = {status dict}
+account_statuses = {}
+account_statuses_lock = threading.Lock()
 link_history_log = []
 
 DASHBOARD_HTML = """<!DOCTYPE html>
@@ -459,7 +501,10 @@ class HealthHandler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            data = {**monitor_status, "history": link_history_log[-50:],
+            with account_statuses_lock:
+                accs = dict(account_statuses)
+            data = {**monitor_status, "accounts": accs,
+                    "history": link_history_log[-50:],
                     "recent_events": event_log[-20:]}
             self.wfile.write(json.dumps(data, indent=2, default=str).encode())
         else:
@@ -553,24 +598,48 @@ def start_health_server():
 # ============================================================
 # MONITOR LOOP — ULTRA-FAST
 # ============================================================
-def monitor_account(account, cfg, cookies):
-    name = account.get("name", account.get("cursor_email", "Main"))
+def monitor_account(account, cfg):
+    name = account.get("name", "Main")
+    cookies = account.get("cookies", {})
+    suffix = account.get("suffix", "")
     known_link = account.get("known_invite_link", "")
     interval = cfg.get("check_interval_seconds", 1)
     history = load_history()
 
-    log_event("info", f"Monitor: {name} | {interval}s interval | ULTRA-FAST mode")
+    # Per-account status
+    acc_status = {
+        "name": name, "status": "starting", "checks": 0,
+        "current_link": "", "session_valid": False,
+        "removals": 0, "rejoins": 0, "errors": 0,
+        "last_check": None, "last_error": "", "last_response_ms": 0,
+    }
+    with account_statuses_lock:
+        account_statuses[name] = acc_status
+
+    class DualStatus:
+        """Updates both per-account and global status dicts."""
+        def __setitem__(self, key, value):
+            acc_status[key] = value
+            monitor_status[key] = value
+        def __getitem__(self, key):
+            return acc_status.get(key, monitor_status.get(key))
+        def get(self, key, default=None):
+            return acc_status.get(key, monitor_status.get(key, default))
+
+    status = DualStatus()
+
+    log_event("info", f"[{name}] Monitor starting | {interval}s interval | cookies_env=SESSION_COOKIES{suffix}")
 
     http = CursorHTTP(cookies)
 
     # ── INITIAL SESSION CHECK ──
-    monitor_status["status"] = "checking_session"
+    status["status"] = "checking_session"
     valid, detail = http.check_session()
     if not valid:
         log_event("session", f"Session invalid on start: {detail}")
-        monitor_status["status"] = "session_expired"
-        monitor_status["session_valid"] = False
-        monitor_status["last_error"] = f"Session invalid: {detail}"
+        status["status"] = "session_expired"
+        status["session_valid"] = False
+        status["last_error"] = f"Session invalid: {detail}"
         send_email(cfg, f"SESSION EXPIRED - {name}",
             "<h2>Session Expired on Start!</h2>"
             "<p>Your Cursor session cookies are invalid.</p>"
@@ -579,27 +648,27 @@ def monitor_account(account, cfg, cookies):
             "<li>Open <b>cursor.com</b> in your browser and log in</li>"
             "<li>Use cookie extension (EditThisCookie / Cookie-Editor) → Export as JSON</li>"
             "<li>Go to Render Dashboard → cursor-invite-monitor → Environment</li>"
-            "<li>Update <b>SESSION_COOKIES</b> env var with the new JSON</li>"
+            f"<li>Update <b>SESSION_COOKIES{suffix}</b> env var with the new JSON</li>"
             "<li>Save → Render auto-redeploys</li>"
             "</ol>")
         while True:
             time.sleep(30)
-            new_cookies = load_cookies()
-            if new_cookies != cookies:
-                log_event("info", "New cookies detected, retrying...")
+            new_cookies = load_cookies(suffix)
+            if new_cookies and new_cookies != cookies:
+                log_event("info", f"[{name}] New cookies detected, retrying...")
                 cookies = new_cookies
                 http = CursorHTTP(cookies)
                 valid, detail = http.check_session()
                 if valid:
-                    log_event("ok", "Session restored!")
-                    monitor_status["session_valid"] = True
+                    log_event("ok", f"[{name}] Session restored!")
+                    status["session_valid"] = True
                     break
     else:
-        log_event("ok", f"Session valid: {detail}")
-        monitor_status["session_valid"] = True
+        log_event("ok", f"[{name}] Session valid: {detail}")
+        status["session_valid"] = True
 
     # ── INITIAL INVITE LINK ──
-    monitor_status["status"] = "extracting_link"
+    status["status"] = "extracting_link"
     link, api_status, api_ms = http.get_invite_link_via_api()
     if link:
         log_event("ok", f"Invite link: {link} ({api_ms}ms)")
@@ -613,8 +682,8 @@ def monitor_account(account, cfg, cookies):
     else:
         log_event("warn", "No invite link found — rejoin will not work without one!")
 
-    monitor_status["current_link"] = known_link or ""
-    monitor_status["status"] = "running"
+    status["current_link"] = known_link or ""
+    status["status"] = "running"
     check_count = 0
     consecutive_errors = 0
     last_session_check = time.time()
@@ -634,9 +703,9 @@ def monitor_account(account, cfg, cookies):
                 last_session_check = time.time()
                 if not valid:
                     log_event("session", f"SESSION EXPIRED: {detail}")
-                    monitor_status["status"] = "session_expired"
-                    monitor_status["session_valid"] = False
-                    monitor_status["last_error"] = f"Session expired: {detail}"
+                    status["status"] = "session_expired"
+                    status["session_valid"] = False
+                    status["last_error"] = f"Session expired: {detail}"
                     send_email(cfg, f"SESSION EXPIRED - {name}",
                         "<h2>Session Expired!</h2>"
                         "<p>Your Cursor session cookies have expired.</p>"
@@ -645,20 +714,20 @@ def monitor_account(account, cfg, cookies):
                         "<li>Open <b>cursor.com</b> in browser → log in</li>"
                         "<li>Cookie extension → Export all cursor.com cookies as JSON</li>"
                         "<li>Render Dashboard → cursor-invite-monitor → Environment</li>"
-                        "<li>Update <b>SESSION_COOKIES</b> with new JSON → Save</li>"
+                        f"<li>Update <b>SESSION_COOKIES{suffix}</b> with new JSON → Save</li>"
                         "</ol>")
                     while True:
                         time.sleep(30)
-                        new_cookies = load_cookies()
-                        if new_cookies != cookies:
-                            log_event("info", "New cookies detected...")
+                        new_cookies = load_cookies(suffix)
+                        if new_cookies and new_cookies != cookies:
+                            log_event("info", f"[{name}] New cookies detected...")
                             cookies = new_cookies
                             http = CursorHTTP(new_cookies)
                             valid, _ = http.check_session()
                             if valid:
                                 log_event("ok", "Session restored!")
-                                monitor_status["session_valid"] = True
-                                monitor_status["status"] = "running"
+                                status["session_valid"] = True
+                                status["status"] = "running"
                                 last_session_check = time.time()
                                 send_email(cfg, f"SESSION RESTORED - {name}",
                                     "<h2>Session Restored!</h2><p>Monitoring resumed.</p>")
@@ -667,9 +736,9 @@ def monitor_account(account, cfg, cookies):
 
             # ── PRIMARY CHECK: GET INVITE LINK VIA API ──
             new_link, api_status, api_ms = http.get_invite_link_via_api()
-            monitor_status["last_response_ms"] = api_ms
-            monitor_status["last_check"] = datetime.now().isoformat()
-            monitor_status["checks"] = check_count
+            status["last_response_ms"] = api_ms
+            status["last_check"] = datetime.now().isoformat()
+            status["checks"] = check_count
 
             # ════════════════════════════════════════════
             # REMOVED FROM TEAM — INSTANT REJOIN
@@ -680,9 +749,9 @@ def monitor_account(account, cfg, cookies):
                 removal_epoch = int(removal_time.timestamp() * 1000)
 
                 log_event("removal", f"REMOVED FROM TEAM at {removal_ts} (API responded in {api_ms}ms)")
-                monitor_status["status"] = "REMOVED_REJOINING"
-                monitor_status["removals"] = monitor_status.get("removals", 0) + 1
-                monitor_status["last_error"] = f"REMOVED at {removal_ts}"
+                status["status"] = "REMOVED_REJOINING"
+                status["removals"] = status.get("removals", 0) + 1
+                status["last_error"] = f"REMOVED at {removal_ts}"
 
                 # Send email in background so it doesn't block rejoin
                 threading.Thread(target=send_email, args=(cfg, f"REMOVED FROM TEAM - {name}",
@@ -694,7 +763,7 @@ def monitor_account(account, cfg, cookies):
 
                 if not known_link:
                     log_event("critical", "NO INVITE LINK — CANNOT REJOIN!")
-                    monitor_status["status"] = "REMOVED_NO_LINK"
+                    status["status"] = "REMOVED_NO_LINK"
                     send_email(cfg, f"CANNOT REJOIN - NO LINK - {name}",
                         f"<h2 style='color:red'>Cannot rejoin — no invite link!</h2>"
                         f"<p>Set KNOWN_INVITE_LINK env var on Render.</p>")
@@ -720,9 +789,9 @@ def monitor_account(account, cfg, cookies):
                             f"Attempt: #{attempt} | "
                             f"Method: {detail}")
 
-                        monitor_status["status"] = "running"
-                        monitor_status["rejoins"] = monitor_status.get("rejoins", 0) + 1
-                        monitor_status["last_error"] = f"Rejoined in {total_ms}ms at {rejoin_ts}"
+                        status["status"] = "running"
+                        status["rejoins"] = status.get("rejoins", 0) + 1
+                        status["last_error"] = f"Rejoined in {total_ms}ms at {rejoin_ts}"
 
                         # Log to history
                         rejoin_record = {
@@ -760,8 +829,8 @@ def monitor_account(account, cfg, cookies):
                 else:
                     # All 60 attempts failed
                     log_event("critical", f"REJOIN FAILED after 60 attempts!")
-                    monitor_status["status"] = "REJOIN_FAILED"
-                    monitor_status["last_error"] = "Rejoin failed after 60 attempts"
+                    status["status"] = "REJOIN_FAILED"
+                    status["last_error"] = "Rejoin failed after 60 attempts"
                     send_email(cfg, f"REJOIN FAILED - {name}",
                         f"<h2 style='color:red'>Auto-Rejoin Failed!</h2>"
                         f"<p>Removed at: {removal_ts}</p>"
@@ -774,7 +843,7 @@ def monitor_account(account, cfg, cookies):
             # ── NORMAL CHECK: link retrieved successfully ──
             if new_link:
                 consecutive_errors = 0
-                monitor_status["current_link"] = new_link
+                status["current_link"] = new_link
 
                 # LINK CHANGED!
                 if new_link != known_link and known_link:
@@ -790,7 +859,7 @@ def monitor_account(account, cfg, cookies):
                     }
                     history.append(record)
                     save_history(history)
-                    monitor_status["link_changes"] += 1
+                    status["link_changes"] = acc_status.get("link_changes", 0) + 1
                     link_history_log.append({"time": now, "old": known_link, "new": new_link})
 
                     known_link = new_link
@@ -824,15 +893,15 @@ def monitor_account(account, cfg, cookies):
                     f"Status: #{check_count} checks | "
                     f"link=...{(known_link or 'none')[-20:]} | "
                     f"api={api_ms}ms | "
-                    f"removals={monitor_status.get('removals', 0)} | "
-                    f"rejoins={monitor_status.get('rejoins', 0)}")
+                    f"removals={status.get('removals', 0)} | "
+                    f"rejoins={status.get('rejoins', 0)}")
 
         except KeyboardInterrupt:
             raise
         except Exception as e:
             log_event("error", f"Check #{check_count} error: {str(e)[:100]}")
-            monitor_status["last_error"] = str(e)[:100]
-            monitor_status["errors"] += 1
+            status["last_error"] = str(e)[:100]
+            status["errors"] = acc_status.get("errors", 0) + 1
             consecutive_errors += 1
 
 
@@ -840,37 +909,39 @@ def main():
     print(f"\n{'='*60}")
     print(f"  CURSOR INVITE LINK MONITOR v8 — ULTRA-FAST")
     print(f"  1s checks | Instant rejoin | Full event log")
+    print(f"  Multi-account support")
     print(f"{'='*60}\n")
 
     start_health_server()
     monitor_status["started"] = datetime.now().isoformat()
 
     cfg = load_config()
-    cookies = load_cookies()
 
-    if not cookies:
-        log_event("critical", "NO COOKIES! Set SESSION_COOKIES env var.")
+    # Auto-discover accounts from env vars
+    accounts = discover_accounts()
+
+    if not accounts:
+        log_event("critical", "NO ACCOUNTS! Set SESSION_COOKIES env var.")
         monitor_status["status"] = "no_cookies"
-        monitor_status["last_error"] = "No session cookies"
+        monitor_status["last_error"] = "No session cookies for any account"
         while True:
             time.sleep(30)
-            cookies = load_cookies()
-            if cookies:
+            accounts = discover_accounts()
+            if accounts:
                 break
 
-    accounts = [a for a in cfg.get("accounts", []) if a.get("enabled", True)]
-    if not accounts:
-        accounts = [{"name": "Main", "known_invite_link": os.environ.get("KNOWN_INVITE_LINK", "")}]
+    log_event("info", f"Found {len(accounts)} account(s): {[a['name'] for a in accounts]}")
 
     if len(accounts) == 1:
-        monitor_account(accounts[0], cfg, cookies)
+        monitor_account(accounts[0], cfg)
     else:
         threads = []
         for acc in accounts:
-            t = threading.Thread(target=monitor_account, args=(acc, cfg, cookies), daemon=True)
+            t = threading.Thread(target=monitor_account, args=(acc, cfg), daemon=True)
             t.start()
             threads.append(t)
-            time.sleep(1)
+            time.sleep(0.5)
+        log_event("info", f"All {len(threads)} account monitors running")
         try:
             for t in threads:
                 t.join()
