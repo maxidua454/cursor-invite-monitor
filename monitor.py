@@ -265,15 +265,24 @@ def wait_for_any(driver, selectors, timeout=15):
 def login_to_cursor(driver, email, password):
     cprint(Fore.CYAN, ">>", f"Logging in as {email}...")
     try:
+        monitor_status["status"] = "login:opening_auth"
         try:
             driver.uc_open_with_reconnect(AUTH_URL, reconnect_time=6)
-        except Exception:
+        except Exception as e:
+            cprint(Fore.YELLOW, "..", f"uc_open fallback: {str(e)[:50]}")
             driver.get(AUTH_URL)
         time.sleep(3)
 
         current = str(driver.current_url)
+        page_title = ""
+        try:
+            page_title = driver.execute_script("return document.title;") or ""
+        except Exception:
+            pass
+        cprint(Fore.CYAN, ">>", f"Auth page: {current[:60]} | title: {page_title[:40]}")
+        monitor_status["status"] = f"login:at_{current[:30]}"
+
         if "cursor.com/dashboard" in current:
-            # Verify actually logged in by checking page content
             time.sleep(2)
             try:
                 text = driver.execute_script("return document.body.innerText;") or ""
@@ -286,8 +295,10 @@ def login_to_cursor(driver, email, password):
             driver.get(AUTH_URL)
             time.sleep(3)
 
+        monitor_status["status"] = "login:solving_cf"
         solve_cloudflare(driver, "login landing")
 
+        monitor_status["status"] = "login:finding_email"
         email_sel = wait_for_any(driver, [
             'input[name="email"]', 'input[type="email"]',
         ], timeout=15)
@@ -297,9 +308,19 @@ def login_to_cursor(driver, email, password):
                 'input[name="email"]', 'input[type="email"]',
             ], timeout=10)
         if not email_sel:
-            cprint(Fore.RED, "!!", "Email field not found")
+            # Dump page info for debugging
+            try:
+                title = driver.execute_script("return document.title;") or ""
+                url = driver.current_url
+                body_text = (driver.execute_script("return document.body.innerText;") or "")[:200]
+                cprint(Fore.RED, "!!", f"Email field not found | URL: {url[:60]} | Title: {title} | Body: {body_text[:100]}")
+                monitor_status["last_error"] = f"No email field | {title} | {url[:60]}"
+            except Exception:
+                cprint(Fore.RED, "!!", "Email field not found (page unreadable)")
+                monitor_status["last_error"] = "No email field (page unreadable)"
             return False
 
+        monitor_status["status"] = "login:typing_email"
         driver.type(email_sel, email)
         cprint(Fore.GREEN, "OK", f"Email: {email}")
 
@@ -313,13 +334,23 @@ def login_to_cursor(driver, email, password):
             """)
         time.sleep(2)
 
+        monitor_status["status"] = "login:finding_password"
         pw_sel = wait_for_any(driver, [
             'input[name="password"]', 'input[type="password"]',
         ], timeout=15)
         if not pw_sel:
-            cprint(Fore.RED, "!!", "Password field not found")
+            try:
+                title = driver.execute_script("return document.title;") or ""
+                url = driver.current_url
+                body_text = (driver.execute_script("return document.body.innerText;") or "")[:200]
+                cprint(Fore.RED, "!!", f"Password field not found | URL: {url[:60]} | Title: {title} | Body: {body_text[:100]}")
+                monitor_status["last_error"] = f"No password field | {title} | {url[:60]}"
+            except Exception:
+                cprint(Fore.RED, "!!", "Password field not found")
+                monitor_status["last_error"] = "No password field"
             return False
 
+        monitor_status["status"] = "login:typing_password"
         driver.type(pw_sel, password)
         cprint(Fore.GREEN, "OK", "Password entered")
 
@@ -334,6 +365,7 @@ def login_to_cursor(driver, email, password):
                 }
             """)
         cprint(Fore.GREEN, "OK", "Sign In clicked")
+        monitor_status["status"] = "login:waiting_redirect"
 
         time.sleep(2)
         solve_cloudflare(driver, "post-signin")
@@ -360,6 +392,7 @@ def login_to_cursor(driver, email, password):
                 cprint(Fore.GREEN, "OK", f"Login success! {url}")
                 return True
             if w % 5 == 0 and w > 0:
+                monitor_status["status"] = f"login:wait_{w}s@{url[:30]}"
                 try:
                     if driver.execute_script("return document.title.includes('Just a moment');"):
                         safe_reconnect(driver, 6)
@@ -369,16 +402,20 @@ def login_to_cursor(driver, email, password):
 
         try:
             src = driver.get_page_source().lower()
+            final_url = driver.current_url
             if "incorrect" in src or "invalid" in src:
                 cprint(Fore.RED, "!!", "Wrong credentials!")
+                monitor_status["last_error"] = "Wrong credentials"
                 return False
         except Exception:
-            pass
+            final_url = "unknown"
 
-        cprint(Fore.RED, "!!", f"Login timeout at {driver.current_url[:60]}")
+        cprint(Fore.RED, "!!", f"Login timeout at {final_url[:60]}")
+        monitor_status["last_error"] = f"Login timeout at {final_url[:60]}"
         return False
     except Exception as e:
         cprint(Fore.RED, "!!", f"Login error: {e}")
+        monitor_status["last_error"] = f"Login error: {str(e)[:100]}"
         return False
 
 
