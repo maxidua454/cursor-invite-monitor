@@ -288,10 +288,12 @@ class CursorHTTP:
             return None, 0
 
     def get_invite_link_via_api(self):
-        """Get invite link via Cursor's dashboard API."""
+        """Get invite link via Cursor's dashboard API.
+        Returns (link, status) where status is 'ok', 'unauthorized', or 'error'.
+        """
         if not self.team_id:
             cprint("!!", "No team_id in cookies, cannot call invite API")
-            return None
+            return None, "error"
         try:
             resp = self.session.post(
                 INVITE_LINK_API,
@@ -309,16 +311,25 @@ class CursorHTTP:
                 link = data.get("inviteLink", "")
                 if link:
                     cprint("OK", f"Got invite link from API: {link}")
-                    return link
+                    return link, "ok"
                 cprint("..", "API returned 200 but no inviteLink field")
+                return None, "ok"
             elif resp.status_code == 401:
-                cprint("!!", "API 401 — session may be expired")
+                # Could be session expired OR removed from team
+                error_msg = ""
+                try:
+                    error_msg = resp.json().get("error", {}).get("message", "")
+                except:
+                    pass
+                cprint("!!", f"API 401 — {error_msg or 'session/team issue'}")
                 self.valid = False
+                return None, "unauthorized"
             else:
                 cprint("..", f"Invite API returned {resp.status_code}")
+                return None, "error"
         except Exception as e:
             cprint("!!", f"Invite API error: {str(e)[:60]}")
-        return None
+            return None, "error"
 
 
 # ============================================================
@@ -569,7 +580,7 @@ def monitor_account(account, cfg, cookies):
 
     # Initial invite link extraction (API first, then HTML fallback)
     monitor_status["status"] = "extracting_link"
-    link = http.get_invite_link_via_api()
+    link, api_status = http.get_invite_link_via_api()
     if not link:
         cprint("..", "API failed, trying HTML scrape...")
         link, code = http.get_invite_link()
@@ -589,6 +600,8 @@ def monitor_account(account, cfg, cookies):
     check_count = 0
     consecutive_errors = 0
     last_session_check = time.time()
+    last_team_check = time.time()
+    removed_notified = False
 
     cprint("OK", "Monitoring started!")
     cprint(">>", f"Known link: {known_link or 'none'}")
@@ -609,23 +622,59 @@ def monitor_account(account, cfg, cookies):
                     monitor_status["last_error"] = f"Session expired: {detail}"
                     send_email(cfg, f"SESSION EXPIRED - {name}",
                         "<h2>Session Expired!</h2>"
-                        "<p>Run get_cookies.py locally and update SESSION_COOKIES on Render.</p>")
+                        "<p>Your Cursor session cookies have expired.</p>"
+                        "<p>To fix: log into cursor.com, extract cookies, "
+                        "update SESSION_COOKIES env var on Render, and redeploy.</p>")
                     # Wait for new cookies
                     while True:
                         time.sleep(60)
                         new_cookies = load_cookies()
-                        http = CursorHTTP(new_cookies)
-                        valid, _ = http.check_session()
-                        if valid:
-                            cprint("OK", "Session restored!")
-                            monitor_status["session_valid"] = True
-                            monitor_status["status"] = "running"
-                            last_session_check = time.time()
-                            break
+                        if new_cookies != cookies:
+                            cprint(">>", "New cookies detected, retrying...")
+                            cookies = new_cookies
+                            http = CursorHTTP(new_cookies)
+                            valid, _ = http.check_session()
+                            if valid:
+                                cprint("OK", "Session restored!")
+                                monitor_status["session_valid"] = True
+                                monitor_status["status"] = "running"
+                                last_session_check = time.time()
+                                break
                     continue
 
+            # Periodic team membership check (every 5 min)
+            if time.time() - last_team_check > 300:
+                team_status, team_detail = http.get_team_status()
+                last_team_check = time.time()
+                if team_status in ("removed", "free_plan", "logged_out"):
+                    cprint("!!", f"TEAM STATUS: {team_status} ({team_detail})")
+                    monitor_status["status"] = f"team_{team_status}"
+                    monitor_status["last_error"] = f"Team: {team_status} — {team_detail}"
+                    if not removed_notified:
+                        removed_notified = True
+                        send_email(cfg, f"REMOVED FROM TEAM - {name}",
+                            f"<h2>You may have been removed from the team!</h2>"
+                            f"<p>Status: {team_status}</p>"
+                            f"<p>Detail: {team_detail}</p>"
+                            f"<p>Check your Cursor dashboard immediately.</p>")
+                elif team_status == "active":
+                    if removed_notified:
+                        cprint("OK", "Back on team!")
+                        removed_notified = False
+                        monitor_status["status"] = "running"
+                        send_email(cfg, f"BACK ON TEAM - {name}",
+                            f"<h2>Team membership restored!</h2>"
+                            f"<p>Detail: {team_detail}</p>")
+
             # Get invite link (API first, HTML fallback)
-            new_link = http.get_invite_link_via_api()
+            new_link, api_status = http.get_invite_link_via_api()
+            if api_status == "unauthorized":
+                # Session expired or removed from team — force re-check
+                monitor_status["status"] = "session_expired"
+                monitor_status["session_valid"] = False
+                last_session_check = 0
+                last_team_check = 0  # Also re-check team status
+                continue
             if not new_link:
                 new_link, code = http.get_invite_link()
                 if code == 401:
