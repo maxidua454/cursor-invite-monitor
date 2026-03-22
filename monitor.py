@@ -48,6 +48,7 @@ log = logging.getLogger("cursor-monitor")
 DASHBOARD_URL = "https://cursor.com/dashboard"
 MEMBERS_URL = "https://cursor.com/dashboard/members"
 SETTINGS_URL = "https://cursor.com/dashboard/settings"
+INVITE_LINK_API = "https://cursor.com/api/dashboard/get-team-invite-link"
 
 # Browser-like headers to avoid basic blocks
 HEADERS = {
@@ -172,6 +173,7 @@ class CursorHTTP:
     def __init__(self, cookies):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
+        self.team_id = cookies.get("team_id", "")
         # Set cookies
         for name, value in cookies.items():
             self.session.cookies.set(name, value, domain=".cursor.com")
@@ -285,43 +287,37 @@ class CursorHTTP:
             cprint("!!", f"Get invite link error: {str(e)[:60]}")
             return None, 0
 
-    def try_get_invite_via_api(self):
-        """Try Cursor's internal API endpoints for team/invite data."""
-        api_urls = [
-            "https://cursor.com/api/dashboard/teams",
-            "https://cursor.com/api/dashboard/team",
-            "https://cursor.com/api/dashboard/members",
-            "https://cursor.com/api/team/invite-link",
-            "https://cursor.com/api/settings",
-        ]
-        for url in api_urls:
-            try:
-                resp = self.session.get(url, timeout=10)
-                if resp.status_code == 200:
-                    try:
-                        data = resp.json()
-                        data_str = json.dumps(data)
-                        m = re.search(r'accept-invite\?code=([a-f0-9]+)', data_str)
-                        if m:
-                            link = f"https://cursor.com/team/accept-invite?code={m.group(1)}"
-                            cprint("OK", f"Found link via API {url}: {link}")
-                            return link
-                        # Check for invite code field
-                        m = re.search(r'"(?:invite_?[Cc]ode|code)"\s*:\s*"([a-f0-9]{20,})"', data_str)
-                        if m:
-                            link = f"https://cursor.com/team/accept-invite?code={m.group(1)}"
-                            cprint("OK", f"Found invite code via API: {link}")
-                            return link
-                        cprint("..", f"API {url.split('/')[-1]}: 200 but no invite link")
-                    except:
-                        # Not JSON, check as text
-                        m = re.search(r'accept-invite\?code=([a-f0-9]+)', resp.text)
-                        if m:
-                            return f"https://cursor.com/team/accept-invite?code={m.group(1)}"
-                elif resp.status_code != 404:
-                    cprint("..", f"API {url.split('/')[-1]}: {resp.status_code}")
-            except:
-                pass
+    def get_invite_link_via_api(self):
+        """Get invite link via Cursor's dashboard API."""
+        if not self.team_id:
+            cprint("!!", "No team_id in cookies, cannot call invite API")
+            return None
+        try:
+            resp = self.session.post(
+                INVITE_LINK_API,
+                json={"teamId": self.team_id},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Referer": MEMBERS_URL,
+                    "Origin": "https://cursor.com",
+                },
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                link = data.get("inviteLink", "")
+                if link:
+                    cprint("OK", f"Got invite link from API: {link}")
+                    return link
+                cprint("..", "API returned 200 but no inviteLink field")
+            elif resp.status_code == 401:
+                cprint("!!", "API 401 — session may be expired")
+                self.valid = False
+            else:
+                cprint("..", f"Invite API returned {resp.status_code}")
+        except Exception as e:
+            cprint("!!", f"Invite API error: {str(e)[:60]}")
         return None
 
 
@@ -571,20 +567,15 @@ def monitor_account(account, cfg, cookies):
         send_email(cfg, f"REMOVED FROM TEAM - {name}",
             f"<h2>Removed from team!</h2><p>Status: {status} ({detail})</p>")
 
-    # Initial invite link extraction
+    # Initial invite link extraction (API first, then HTML fallback)
     monitor_status["status"] = "extracting_link"
-    link, code = http.get_invite_link()
+    link = http.get_invite_link_via_api()
+    if not link:
+        cprint("..", "API failed, trying HTML scrape...")
+        link, code = http.get_invite_link()
     if link:
         cprint("OK", f"Invite link: {link}")
         if link != known_link:
-            known_link = link
-            account["known_invite_link"] = link
-            save_config(cfg)
-    else:
-        cprint("..", "No invite link in HTML, trying API...")
-        api_link = http.try_get_invite_via_api()
-        if api_link:
-            link = api_link
             known_link = link
             account["known_invite_link"] = link
             save_config(cfg)
@@ -633,33 +624,27 @@ def monitor_account(account, cfg, cookies):
                             break
                     continue
 
-            # Get invite link
-            new_link, code = http.get_invite_link()
-
-            if code == 401:
-                # Session expired during check
-                monitor_status["status"] = "session_expired"
-                monitor_status["session_valid"] = False
-                last_session_check = 0  # Force re-check
-                continue
+            # Get invite link (API first, HTML fallback)
+            new_link = http.get_invite_link_via_api()
+            if not new_link:
+                new_link, code = http.get_invite_link()
+                if code == 401:
+                    monitor_status["status"] = "session_expired"
+                    monitor_status["session_valid"] = False
+                    last_session_check = 0
+                    continue
 
             monitor_status["last_check"] = datetime.now().isoformat()
             monitor_status["checks"] = check_count
 
             if new_link is None:
                 consecutive_errors += 1
-                if consecutive_errors >= 10:
-                    # Try API fallback
-                    api_link = http.try_get_invite_via_api()
-                    if api_link:
-                        new_link = api_link
-                        consecutive_errors = 0
-                    else:
-                        cprint("..", f"#{check_count}: No link found ({consecutive_errors} consecutive)")
                 if consecutive_errors >= 30:
                     cprint("!!", "Too many consecutive failures, checking session...")
                     last_session_check = 0
                     consecutive_errors = 0
+                elif consecutive_errors % 10 == 0:
+                    cprint("..", f"#{check_count}: No link found ({consecutive_errors} consecutive)")
                 continue
 
             consecutive_errors = 0
