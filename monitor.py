@@ -169,10 +169,20 @@ def send_email(cfg, subject, body):
 # ============================================================
 # BROWSER HELPERS (SeleniumBase UC mode)
 # ============================================================
+IS_DOCKER = os.path.exists("/.dockerenv") or os.environ.get("RENDER", "")
+
+
 def create_browser(headless=True):
     """Create a SeleniumBase undetected Chrome browser."""
-    cprint(Fore.CYAN, ">>", f"Creating browser (headless={headless})...")
-    driver = Driver(uc=True, headless=headless)
+    cprint(Fore.CYAN, ">>", f"Creating browser (headless={headless}, docker={IS_DOCKER})...")
+    if IS_DOCKER:
+        driver = Driver(
+            uc=True, headless=True,
+            uc_cdp_events=True,
+            chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu,--disable-software-rasterizer",
+        )
+    else:
+        driver = Driver(uc=True, headless=headless)
     cprint(Fore.GREEN, "OK", "Browser ready")
     return driver
 
@@ -205,7 +215,11 @@ def solve_cloudflare(driver, context="page"):
                 return True  # No challenge
 
             cprint(Fore.YELLOW, "CF", f"Turnstile on {context} (attempt {attempt+1}/3) - reconnect trick...")
-            driver.reconnect(8)
+            try:
+                driver.reconnect(8)
+            except Exception as re:
+                cprint(Fore.YELLOW, "..", f"reconnect failed: {re}, waiting...")
+                time.sleep(8)
             time.sleep(1)
 
             still_blocked = driver.execute_script("""
@@ -230,7 +244,10 @@ def solve_cloudflare(driver, context="page"):
                 return True
 
             cprint(Fore.YELLOW, "..", f"Attempt {attempt+1} didn't clear, trying longer...")
-            driver.reconnect(12)
+            try:
+                driver.reconnect(12)
+            except Exception:
+                time.sleep(12)
             time.sleep(1)
 
         except Exception as e:
@@ -271,8 +288,12 @@ def login_to_cursor(driver, email, password):
 
     try:
         # Step 1: Open auth page
-        driver.uc_open_with_reconnect(AUTH_URL, reconnect_time=6)
-        time.sleep(2)
+        try:
+            driver.uc_open_with_reconnect(AUTH_URL, reconnect_time=6)
+        except Exception as e:
+            cprint(Fore.YELLOW, "..", f"uc_open failed ({e}), using regular get...")
+            driver.get(AUTH_URL)
+        time.sleep(3)
 
         # Handle CF on landing
         if not solve_cloudflare(driver, "login landing"):
@@ -688,16 +709,21 @@ def monitor_account(account, cfg):
     while True:  # Outer restart loop
         driver = None
         try:
+            monitor_status["status"] = "creating_browser"
             driver = create_browser(headless=headless)
 
             # Login
+            monitor_status["status"] = "logging_in"
             for attempt in range(5):
                 if login_to_cursor(driver, email, password):
                     break
                 cprint(Fore.YELLOW, "..", f"Login attempt {attempt+1}/5 failed, retrying in 10s...")
+                monitor_status["status"] = f"login_retry_{attempt+1}"
                 time.sleep(10)
             else:
                 cprint(Fore.RED, "!!", "All login attempts failed. Retrying in 60s...")
+                monitor_status["status"] = "login_failed"
+                monitor_status["errors"] += 1
                 quit_browser(driver)
                 time.sleep(60)
                 continue

@@ -29,6 +29,7 @@ RUN python -c "from seleniumbase import Driver; d = Driver(uc=True, headless=Tru
 
 ENV PYTHONUNBUFFERED=1
 ENV PORT=10000
+ENV RENDER=true
 
 EXPOSE 10000
 
