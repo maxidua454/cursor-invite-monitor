@@ -358,112 +358,90 @@ def login_to_cursor(driver, email, password):
         driver.type(pw_sel, password)
         cprint(Fore.GREEN, "OK", "Password entered")
 
-        # Click Sign In
+        # KEY TRICK: Schedule Sign In click via setTimeout, then disconnect
+        # Chrome before it fires. When the click happens, Chrome is disconnected
+        # from Selenium so Cloudflare can't detect automation during the redirect.
         monitor_status["status"] = "login:clicking_signin"
-        sign_sel = wait_for_any(driver, ['button[type="submit"]'], timeout=5)
-        if sign_sel:
-            driver.click(sign_sel)
-        else:
-            driver.execute_script("""
+        cprint(Fore.CYAN, ">>", "Scheduling Sign In click + disconnect...")
+
+        # Schedule the click to fire in 1 second
+        driver.execute_script("""
+            setTimeout(function() {
+                var btn = document.querySelector('button[type="submit"]');
+                if (btn) { btn.click(); return; }
                 var btns = document.querySelectorAll('button');
                 for (var b of btns) {
-                    if (b.textContent.includes('Sign in')) { b.click(); break; }
+                    if (b.textContent.includes('Sign in')) { b.click(); return; }
                 }
-            """)
-        cprint(Fore.GREEN, "OK", "Sign In clicked")
-        monitor_status["status"] = "login:waiting_redirect"
-        time.sleep(3)
+            }, 1000);
+        """)
 
-        # Check if already redirected
+        # Disconnect BEFORE the click fires
         try:
-            url = driver.current_url
+            driver.disconnect()
+            cprint(Fore.GREEN, "OK", "Disconnected before click")
+        except Exception as e:
+            cprint(Fore.YELLOW, "..", f"disconnect: {str(e)[:40]}")
+
+        # Wait while disconnected — click fires, form submits, CF challenge
+        # happens, redirect completes — all without Selenium connected
+        monitor_status["status"] = "login:disconnected_waiting"
+        time.sleep(12)
+
+        # Reconnect
+        try:
+            driver.reconnect(3)
+            cprint(Fore.GREEN, "OK", "Reconnected")
+        except Exception as e:
+            cprint(Fore.YELLOW, "..", f"reconnect: {str(e)[:40]}")
+            time.sleep(3)
+
+        monitor_status["status"] = "login:checking_result"
+
+        # Check if we landed on dashboard
+        for w in range(15):
+            try:
+                url = driver.current_url
+                cprint(Fore.CYAN, ">>", f"Post-login URL: {url[:60]}") if w == 0 else None
+            except Exception:
+                time.sleep(1)
+                continue
+
             if "cursor.com" in url and "authenticator" not in url:
                 cprint(Fore.GREEN, "OK", f"Login success! {url}")
                 return True
-        except Exception:
-            pass
 
-        # Check for Turnstile widget and try to solve it
-        monitor_status["status"] = "login:solving_turnstile"
-        cprint(Fore.CYAN, ">>", "Checking for Turnstile challenge...")
-
-        for ts_attempt in range(3):
-            try:
-                has_turnstile = driver.execute_script("""
-                    return document.querySelector('iframe[src*="turnstile"]') !== null
-                        || document.querySelector('#cf-turnstile') !== null
-                        || document.querySelector('[class*="turnstile"]') !== null
-                        || document.title.includes('Just a moment');
-                """)
-                if not has_turnstile:
-                    # No Turnstile, check if we redirected
-                    url = driver.current_url
-                    if "cursor.com" in url and "authenticator" not in url:
-                        cprint(Fore.GREEN, "OK", f"Login success! {url}")
-                        return True
-                    # Maybe credentials were wrong or page is processing
-                    cprint(Fore.YELLOW, "..", f"No Turnstile, still at {url[:50]}")
-                    time.sleep(2)
-                    continue
-
-                cprint(Fore.YELLOW, "CF", f"Turnstile detected (attempt {ts_attempt+1}/3)")
-
-                # Method 1: uc_gui_click_captcha (physical click via xdotool)
+            # If still on CF, try reconnect again
+            if w == 5:
                 try:
-                    driver.uc_gui_click_captcha()
-                    time.sleep(4)
-                    url = driver.current_url
-                    if "cursor.com" in url and "authenticator" not in url:
-                        cprint(Fore.GREEN, "OK", f"Login success (gui click)! {url}")
-                        return True
-                    cprint(Fore.CYAN, ">>", f"After gui_click: {url[:50]}")
-                except Exception as e:
-                    cprint(Fore.YELLOW, "..", f"gui_click err: {str(e)[:50]}")
+                    is_cf = driver.execute_script(
+                        "return document.title.includes('Just a moment');"
+                    )
+                    if is_cf:
+                        cprint(Fore.YELLOW, "CF", "Still on CF, reconnecting...")
+                        safe_reconnect(driver, 10)
+                except Exception:
+                    pass
 
-                # Method 2: reconnect trick
+            # If still stuck at 10s, try direct dashboard nav
+            if w == 10:
+                monitor_status["status"] = "login:try_direct_nav"
+                cprint(Fore.CYAN, ">>", "Trying direct nav to dashboard...")
                 try:
-                    safe_reconnect(driver, 8)
-                    time.sleep(2)
-                    url = driver.current_url
-                    if "cursor.com" in url and "authenticator" not in url:
-                        cprint(Fore.GREEN, "OK", f"Login success (reconnect)! {url}")
-                        return True
-                except Exception as e:
-                    cprint(Fore.YELLOW, "..", f"reconnect err: {str(e)[:40]}")
-
-            except Exception as e:
-                cprint(Fore.YELLOW, "..", f"Turnstile attempt err: {str(e)[:50]}")
+                    driver.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=6)
+                except Exception:
+                    driver.get(DASHBOARD_URL)
                 time.sleep(2)
-
-        # Fallback: try direct nav to dashboard
-        monitor_status["status"] = "login:try_direct_nav"
-        cprint(Fore.CYAN, ">>", "Trying direct nav to dashboard...")
-        try:
-            driver.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=6)
-        except Exception:
-            driver.get(DASHBOARD_URL)
-        time.sleep(3)
-        solve_cloudflare(driver, "dashboard")
-
-        try:
-            url = driver.current_url
-            if "cursor.com" in url and "authenticator" not in url:
-                text = driver.execute_script("return document.body.innerText;") or ""
-                if any(k in text for k in ["Team Plan", "Overview", "Settings", "Usage"]):
-                    cprint(Fore.GREEN, "OK", f"Login success (direct nav)! {url}")
-                    return True
-        except Exception:
-            pass
-
-        # Brief wait
-        for w in range(10):
-            try:
-                url = driver.current_url
-                if "cursor.com" in url and "authenticator" not in url:
-                    cprint(Fore.GREEN, "OK", f"Login success! {url}")
-                    return True
-            except Exception:
-                pass
+                solve_cloudflare(driver, "dashboard")
+                try:
+                    url = driver.current_url
+                    if "cursor.com" in url and "authenticator" not in url:
+                        text = driver.execute_script("return document.body.innerText;") or ""
+                        if any(k in text for k in ["Team Plan", "Overview", "Settings", "Usage"]):
+                            cprint(Fore.GREEN, "OK", f"Login success (direct)! {url}")
+                            return True
+                except Exception:
+                    pass
             time.sleep(1)
 
         try:
