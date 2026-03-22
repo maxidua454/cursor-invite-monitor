@@ -166,13 +166,18 @@ def create_browser():
     """
     cprint(Fore.CYAN, ">>", f"Creating browser (docker={IS_DOCKER})...")
     if IS_DOCKER:
-        # In Docker, use headed mode with Xvfb virtual display
-        # This bypasses Cloudflare much better than headless
         driver = Driver(
             uc=True,
-            headed=True,  # Headed mode with Xvfb = undetectable
+            headed=True,
             uc_cdp_events=True,
-            chromium_arg="--no-sandbox,--disable-dev-shm-usage,--disable-gpu",
+            chromium_arg=(
+                "--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
+                "--disable-software-rasterizer,--disable-extensions,"
+                "--disable-background-timer-throttling,"
+                "--disable-backgrounding-occluded-windows,"
+                "--disable-renderer-backgrounding,"
+                "--window-size=1280,720"
+            ),
         )
     else:
         driver = Driver(uc=True, headless=False)
@@ -266,9 +271,20 @@ def login_to_cursor(driver, email, password):
             driver.get(AUTH_URL)
         time.sleep(3)
 
-        if "dashboard" in str(driver.current_url):
-            cprint(Fore.GREEN, "OK", "Already logged in!")
-            return True
+        current = str(driver.current_url)
+        if "cursor.com/dashboard" in current:
+            # Verify actually logged in by checking page content
+            time.sleep(2)
+            try:
+                text = driver.execute_script("return document.body.innerText;") or ""
+                if "Team Plan" in text or "Overview" in text or "Settings" in text:
+                    cprint(Fore.GREEN, "OK", "Already logged in!")
+                    return True
+            except Exception:
+                pass
+            cprint(Fore.YELLOW, "!!", "Dashboard URL but not logged in, proceeding...")
+            driver.get(AUTH_URL)
+            time.sleep(3)
 
         solve_cloudflare(driver, "login landing")
 
@@ -516,14 +532,143 @@ monitor_status = {
     "link_changes": 0, "current_link": "", "status": "starting",
     "errors": 0, "last_error": "",
 }
+link_history_log = []  # In-memory log: [{time, old, new}, ...]
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>Cursor Monitor</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="10">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:20px}
+h1{color:#58a6ff;margin-bottom:20px;font-size:24px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:20px;margin-bottom:16px}
+.card h2{color:#8b949e;font-size:14px;text-transform:uppercase;margin-bottom:12px}
+.stat-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+.stat{background:#21262d;border-radius:8px;padding:16px;text-align:center}
+.stat .val{font-size:28px;font-weight:bold;color:#58a6ff}
+.stat .label{font-size:12px;color:#8b949e;margin-top:4px}
+.stat.ok .val{color:#3fb950}
+.stat.warn .val{color:#d29922}
+.stat.err .val{color:#f85149}
+.link-box{background:#21262d;border-radius:8px;padding:16px;margin-top:12px;word-break:break-all}
+.link-box a{color:#58a6ff;text-decoration:none;font-size:16px}
+.link-box a:hover{text-decoration:underline}
+.link-box .time{color:#8b949e;font-size:12px;margin-top:4px}
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th{text-align:left;color:#8b949e;font-size:12px;padding:8px;border-bottom:1px solid #30363d}
+td{padding:8px;border-bottom:1px solid #21262d;font-size:13px}
+td a{color:#58a6ff;text-decoration:none}
+.badge{display:inline-block;padding:4px 10px;border-radius:12px;font-size:12px;font-weight:600}
+.badge.running{background:#0d2818;color:#3fb950}
+.badge.starting{background:#2d2200;color:#d29922}
+.badge.error{background:#2d0f0f;color:#f85149}
+.badge.login{background:#1a1a3e;color:#bc8cff}
+</style></head><body>
+<h1>Cursor Invite Link Monitor</h1>
+
+<div class="card">
+<h2>Status</h2>
+<div class="stat-grid">
+<div class="stat ok"><div class="val">{status_badge}</div><div class="label">Status</div></div>
+<div class="stat"><div class="val">{checks}</div><div class="label">Checks Done</div></div>
+<div class="stat {changes_class}"><div class="val">{link_changes}</div><div class="label">Link Changes</div></div>
+<div class="stat {err_class}"><div class="val">{errors}</div><div class="label">Errors</div></div>
+</div>
+</div>
+
+<div class="card">
+<h2>Current Invite Link</h2>
+<div class="link-box">
+{current_link_html}
+<div class="time">Last checked: {last_check}</div>
+</div>
+</div>
+
+<div class="card">
+<h2>Link Change History</h2>
+{history_html}
+</div>
+
+<div class="card">
+<h2>Details</h2>
+<div class="stat-grid">
+<div class="stat"><div class="val" style="font-size:14px">{started}</div><div class="label">Started</div></div>
+<div class="stat"><div class="val" style="font-size:14px">{last_error_short}</div><div class="label">Last Error</div></div>
+</div>
+</div>
+
+<p style="color:#8b949e;font-size:11px;margin-top:20px;text-align:center">Auto-refreshes every 10 seconds | <a href="/api" style="color:#58a6ff">JSON API</a></p>
+</body></html>"""
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.end_headers()
-        self.wfile.write(json.dumps(monitor_status, indent=2, default=str).encode())
+        if self.path == "/api" or self.path == "/health" or self.path == "/ping":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            data = {**monitor_status, "history": link_history_log[-20:]}
+            self.wfile.write(json.dumps(data, indent=2, default=str).encode())
+        else:
+            # Dashboard HTML
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+
+            s = monitor_status
+            status_text = s["status"]
+            if "running" in status_text:
+                badge = '<span class="badge running">RUNNING</span>'
+            elif "login" in status_text:
+                badge = f'<span class="badge login">{status_text}</span>'
+            elif "error" in status_text or "fail" in status_text:
+                badge = f'<span class="badge error">{status_text}</span>'
+            else:
+                badge = f'<span class="badge starting">{status_text}</span>'
+
+            link = s.get("current_link", "")
+            if link:
+                link_html = f'<a href="{link}">{link}</a>'
+            else:
+                link_html = '<span style="color:#8b949e">Not yet extracted...</span>'
+
+            last_check = s.get("last_check", "Never")
+            if last_check and last_check != "Never":
+                last_check = last_check[:19].replace("T", " ")
+
+            # History table
+            history = link_history_log[-20:]
+            if history:
+                rows = ""
+                for h in reversed(history):
+                    ts = h.get("time", "")[:19]
+                    old = h.get("old", "")
+                    new = h.get("new", "")
+                    rows += f'<tr><td>{ts}</td><td><a href="{old}">{old[-20:]}</a></td><td><a href="{new}">{new[-20:]}</a></td></tr>'
+                hist_html = f'<table><tr><th>Time</th><th>Old Link</th><th>New Link</th></tr>{rows}</table>'
+            else:
+                hist_html = '<p style="color:#8b949e;padding:12px">No changes detected yet</p>'
+
+            started = (s.get("started") or "")[:19].replace("T", " ")
+            last_err = s.get("last_error", "None")
+            last_err_short = (last_err[:50] + "...") if len(last_err) > 50 else last_err
+
+            html = DASHBOARD_HTML.format(
+                status_badge=badge,
+                checks=s["checks"],
+                link_changes=s["link_changes"],
+                changes_class="warn" if s["link_changes"] > 0 else "",
+                errors=s["errors"],
+                err_class="err" if s["errors"] > 0 else "",
+                current_link_html=link_html,
+                last_check=last_check,
+                history_html=hist_html,
+                started=started,
+                last_error_short=last_err_short,
+            )
+            self.wfile.write(html.encode())
 
     def log_message(self, *a):
         pass
@@ -660,6 +805,9 @@ def monitor_account(account, cfg):
                         history.append(record)
                         save_history(history)
                         monitor_status["link_changes"] += 1
+                        link_history_log.append({
+                            "time": now, "old": known_link, "new": new_link
+                        })
 
                         known_link = new_link
                         account["known_invite_link"] = new_link
