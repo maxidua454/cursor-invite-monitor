@@ -1,29 +1,15 @@
 """
-CURSOR INVITE LINK MONITOR v6
-- SeleniumBase UC mode with Xvfb virtual display in Docker
-- Cloudflare/Turnstile bypass via reconnect trick
-- Multi-account support
-- Detects removal → auto-rejoin
+CURSOR INVITE LINK MONITOR v7
+- Pure HTTP monitoring (no browser, no Cloudflare issues)
+- Session cookies from get_cookies.py (run locally once)
+- Auto-detects link changes, removal, session expiry
 - Email notifications
-- Health endpoint for UptimeRobot
+- Visual dashboard + JSON API
 - Self-healing, never dies
 """
 
 import sys
-import subprocess
 import os
-
-# Auto-install deps
-for pkg in ["seleniumbase", "colorama"]:
-    try:
-        __import__(pkg)
-    except ImportError:
-        print(f"[*] Installing {pkg}...")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", pkg, "--quiet"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-
 import json
 import time
 import re
@@ -35,16 +21,19 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
-from seleniumbase import Driver
-from colorama import init, Fore, Style
 
-init(autoreset=True)
+try:
+    import requests
+except ImportError:
+    import subprocess
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
+    import requests
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
+COOKIE_PATH = BASE_DIR / "cookies.json"
 HISTORY_PATH = BASE_DIR / "link_history.json"
 LOG_FILE = BASE_DIR / "monitor.log"
-IS_DOCKER = os.path.exists("/.dockerenv") or os.environ.get("RENDER", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -56,23 +45,39 @@ logging.basicConfig(
 )
 log = logging.getLogger("cursor-monitor")
 
-AUTH_URL = "https://authenticator.cursor.sh/"
 DASHBOARD_URL = "https://cursor.com/dashboard"
 MEMBERS_URL = "https://cursor.com/dashboard/members"
+SETTINGS_URL = "https://cursor.com/dashboard/settings"
+
+# Browser-like headers to avoid basic blocks
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 
 
-def cprint(color, symbol, msg):
+def cprint(symbol, msg):
     ts = datetime.now().strftime("%H:%M:%S")
-    print(f"{color}{ts} [{symbol}] {msg}{Style.RESET_ALL}")
+    print(f"{ts} [{symbol}] {msg}")
     log.info(f"[{symbol}] {msg}")
 
 
 # ============================================================
-# CONFIG & HISTORY
+# CONFIG & COOKIES
 # ============================================================
 def load_config():
     if not CONFIG_PATH.exists():
-        cprint(Fore.YELLOW, "!!", "No config.json, building from env vars...")
+        cprint("!!", "No config.json, building from env vars...")
         cfg = {
             "accounts": [{
                 "name": os.environ.get("ACCOUNT_NAME", "Main"),
@@ -91,6 +96,7 @@ def load_config():
 
     with open(CONFIG_PATH, "r") as f:
         cfg = json.load(f)
+    # Override with env vars
     for env_key, cfg_key in [
         ("NOTIFICATION_EMAIL", "notification_email"),
         ("GMAIL_APP_PASSWORD", "gmail_app_password"),
@@ -117,6 +123,34 @@ def save_config(cfg):
         json.dump(cfg, f, indent=4)
 
 
+def load_cookies():
+    """Load session cookies from env var or file."""
+    # Priority 1: env var SESSION_COOKIES (JSON string)
+    env_cookies = os.environ.get("SESSION_COOKIES", "")
+    if env_cookies:
+        try:
+            cookies = json.loads(env_cookies)
+            cprint("OK", f"Loaded {len(cookies)} cookies from env var")
+            return cookies
+        except json.JSONDecodeError:
+            cprint("!!", "SESSION_COOKIES env var is not valid JSON")
+
+    # Priority 2: cookies.json file
+    if COOKIE_PATH.exists():
+        with open(COOKIE_PATH, "r") as f:
+            cookies = json.load(f)
+        cprint("OK", f"Loaded {len(cookies)} cookies from cookies.json")
+        return cookies
+
+    cprint("!!", "No cookies found! Run get_cookies.py locally first.")
+    return {}
+
+
+def save_cookies(cookies):
+    with open(COOKIE_PATH, "w") as f:
+        json.dump(cookies, f, indent=2)
+
+
 def load_history():
     if HISTORY_PATH.exists():
         with open(HISTORY_PATH, "r") as f:
@@ -130,13 +164,175 @@ def save_history(history):
 
 
 # ============================================================
+# HTTP SESSION
+# ============================================================
+class CursorHTTP:
+    """HTTP client for Cursor dashboard using session cookies."""
+
+    def __init__(self, cookies):
+        self.session = requests.Session()
+        self.session.headers.update(HEADERS)
+        # Set cookies
+        for name, value in cookies.items():
+            self.session.cookies.set(name, value, domain=".cursor.com")
+        self.valid = True
+
+    def check_session(self):
+        """Check if session is still valid."""
+        try:
+            resp = self.session.get(DASHBOARD_URL, allow_redirects=False, timeout=15)
+            # If redirected to auth, session expired
+            if resp.status_code in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if "authenticator" in location or "login" in location:
+                    cprint("!!", "Session expired (redirect to login)")
+                    self.valid = False
+                    return False, "session_expired"
+                # Redirect to another cursor.com page is OK
+                return True, "redirect"
+
+            if resp.status_code == 403:
+                cprint("!!", "403 Forbidden — cookies may be invalid or CF blocked")
+                self.valid = False
+                return False, "forbidden"
+
+            if resp.status_code == 200:
+                text = resp.text
+                if "authenticator" in text and "Sign in" in text:
+                    self.valid = False
+                    return False, "session_expired"
+                return True, "ok"
+
+            cprint("!!", f"Unexpected status: {resp.status_code}")
+            return False, f"status_{resp.status_code}"
+        except Exception as e:
+            cprint("!!", f"Session check error: {str(e)[:60]}")
+            return False, str(e)[:60]
+
+    def get_team_status(self):
+        """Check team membership status."""
+        try:
+            resp = self.session.get(DASHBOARD_URL, timeout=15)
+            if resp.status_code != 200:
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location", "")
+                    if "authenticator" in location:
+                        return "logged_out", "Session expired"
+                return "error", f"HTTP {resp.status_code}"
+
+            text = resp.text
+            if "Team Plan" in text:
+                return "active", "Team Plan"
+            if "Free" in text and "Plan" in text:
+                return "free_plan", "Free plan — may be removed"
+            if "authenticator" in text:
+                return "logged_out", "Session expired"
+            return "active", "Dashboard accessible"
+        except Exception as e:
+            return "error", str(e)[:60]
+
+    def get_invite_link(self):
+        """Extract invite link from members page."""
+        try:
+            resp = self.session.get(MEMBERS_URL, timeout=15)
+            if resp.status_code != 200:
+                cprint("!!", f"Members page HTTP {resp.status_code}")
+                return None, resp.status_code
+
+            html = resp.text
+
+            # Method 1: Regex search for invite link
+            m = re.search(r'https://cursor\.com/team/accept-invite\?code=[a-f0-9]+', html)
+            if m:
+                return m.group(0), 200
+
+            # Method 2: Look for invite code in JSON data / Next.js props
+            m = re.search(r'"inviteCode"\s*:\s*"([a-f0-9]+)"', html)
+            if m:
+                return f"https://cursor.com/team/accept-invite?code={m.group(1)}", 200
+
+            # Method 3: Look for code in any format
+            m = re.search(r'accept-invite\?code=([a-f0-9]+)', html)
+            if m:
+                return f"https://cursor.com/team/accept-invite?code={m.group(1)}", 200
+
+            # Method 4: Check Next.js __NEXT_DATA__ for invite info
+            m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+            if m:
+                try:
+                    next_data = json.loads(m.group(1))
+                    # Search recursively for invite code
+                    data_str = json.dumps(next_data)
+                    code_match = re.search(r'accept-invite\?code=([a-f0-9]+)', data_str)
+                    if code_match:
+                        return f"https://cursor.com/team/accept-invite?code={code_match.group(1)}", 200
+                except:
+                    pass
+
+            # Check if we can see members at all
+            if "Members" in html or "members" in html:
+                cprint("..", "Members page loaded but no invite link found in HTML")
+                cprint("..", "The link may only appear after clicking 'Invite' button")
+                return None, 200
+            elif "authenticator" in html or "Sign in" in html:
+                cprint("!!", "Session expired")
+                return None, 401
+            else:
+                cprint("..", f"Unknown page content (length={len(html)})")
+                return None, 200
+
+        except Exception as e:
+            cprint("!!", f"Get invite link error: {str(e)[:60]}")
+            return None, 0
+
+    def try_get_invite_via_api(self):
+        """Try Cursor's internal API endpoints for team/invite data."""
+        api_urls = [
+            "https://cursor.com/api/dashboard/teams",
+            "https://cursor.com/api/dashboard/team",
+            "https://cursor.com/api/dashboard/members",
+            "https://cursor.com/api/team/invite-link",
+            "https://cursor.com/api/settings",
+        ]
+        for url in api_urls:
+            try:
+                resp = self.session.get(url, timeout=10)
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        data_str = json.dumps(data)
+                        m = re.search(r'accept-invite\?code=([a-f0-9]+)', data_str)
+                        if m:
+                            link = f"https://cursor.com/team/accept-invite?code={m.group(1)}"
+                            cprint("OK", f"Found link via API {url}: {link}")
+                            return link
+                        # Check for invite code field
+                        m = re.search(r'"(?:invite_?[Cc]ode|code)"\s*:\s*"([a-f0-9]{20,})"', data_str)
+                        if m:
+                            link = f"https://cursor.com/team/accept-invite?code={m.group(1)}"
+                            cprint("OK", f"Found invite code via API: {link}")
+                            return link
+                        cprint("..", f"API {url.split('/')[-1]}: 200 but no invite link")
+                    except:
+                        # Not JSON, check as text
+                        m = re.search(r'accept-invite\?code=([a-f0-9]+)', resp.text)
+                        if m:
+                            return f"https://cursor.com/team/accept-invite?code={m.group(1)}"
+                elif resp.status_code != 404:
+                    cprint("..", f"API {url.split('/')[-1]}: {resp.status_code}")
+            except:
+                pass
+        return None
+
+
+# ============================================================
 # EMAIL
 # ============================================================
 def send_email(cfg, subject, body):
     email_addr = cfg.get("notification_email", "")
     app_pw = cfg.get("gmail_app_password", "")
     if not email_addr or not app_pw or app_pw == "NEED_APP_PASSWORD":
-        cprint(Fore.YELLOW, "!!", f"Email skip | {subject}")
+        cprint("!!", f"Email skip (not configured) | {subject}")
         return False
     try:
         msg = MIMEMultipart()
@@ -148,483 +344,22 @@ def send_email(cfg, subject, body):
             server.starttls()
             server.login(email_addr, app_pw)
             server.send_message(msg)
-        cprint(Fore.GREEN, "OK", "Email sent!")
+        cprint("OK", "Email sent!")
         return True
     except Exception as e:
-        cprint(Fore.RED, "!!", f"Email failed: {e}")
+        cprint("!!", f"Email failed: {e}")
         return False
 
 
 # ============================================================
-# BROWSER HELPERS
-# ============================================================
-def create_browser():
-    """
-    Create SeleniumBase UC browser.
-    In Docker: uses Xvfb (virtual display) + headed mode for better CF bypass.
-    Locally: headless mode.
-    """
-    cprint(Fore.CYAN, ">>", f"Creating browser (docker={IS_DOCKER})...")
-    if IS_DOCKER:
-        driver = Driver(
-            uc=True,
-            headed=True,
-            uc_cdp_events=True,
-            chromium_arg=(
-                "--no-sandbox,--disable-dev-shm-usage,--disable-gpu,"
-                "--disable-software-rasterizer,--disable-extensions,"
-                "--disable-background-timer-throttling,"
-                "--disable-backgrounding-occluded-windows,"
-                "--disable-renderer-backgrounding,"
-                "--window-size=1280,720"
-            ),
-        )
-    else:
-        driver = Driver(uc=True, headless=False)
-    cprint(Fore.GREEN, "OK", "Browser ready")
-    return driver
-
-
-def quit_browser(driver):
-    try:
-        driver.quit()
-    except Exception:
-        pass
-
-
-def safe_reconnect(driver, wait=8):
-    """Reconnect with fallback for Docker."""
-    try:
-        driver.reconnect(wait)
-    except Exception as e:
-        cprint(Fore.YELLOW, "..", f"reconnect fallback: {str(e)[:40]}")
-        time.sleep(wait)
-
-
-def solve_cloudflare(driver, context="page"):
-    for attempt in range(4):
-        try:
-            is_cf = driver.execute_script("""
-                return document.title.includes('Just a moment')
-                    || document.querySelector('#challenge-running') !== null
-                    || document.querySelector('#challenge-stage') !== null
-                    || document.querySelector('iframe[src*="turnstile"]') !== null
-                    || document.querySelector('[class*="turnstile"]') !== null
-                    || document.querySelector('#cf-turnstile') !== null;
-            """)
-            if not is_cf:
-                return True
-
-            cprint(Fore.YELLOW, "CF", f"{context} (attempt {attempt+1}/4)")
-
-            # Method 1: reconnect trick (disconnect/reconnect bypasses CF)
-            safe_reconnect(driver, 8)
-            time.sleep(1)
-
-            still = driver.execute_script(
-                "return document.title.includes('Just a moment') || "
-                "document.querySelector('#challenge-running') !== null;"
-            )
-            if not still:
-                cprint(Fore.GREEN, "OK", "CF bypassed!")
-                return True
-
-            # Check if token was auto-solved
-            token = driver.execute_script("""
-                var inp = document.querySelector('input[name="cf-turnstile-response"]');
-                if (inp && inp.value && inp.value.length > 20) return true;
-                return false;
-            """)
-            if token:
-                cprint(Fore.GREEN, "OK", "Turnstile solved!")
-                return True
-
-            # Method 2: longer reconnect
-            safe_reconnect(driver, 12)
-            time.sleep(2)
-        except Exception as e:
-            cprint(Fore.YELLOW, "..", f"CF error: {str(e)[:50]}")
-            time.sleep(1)
-
-    cprint(Fore.RED, "!!", "CF bypass failed")
-    return False
-
-
-def wait_for_any(driver, selectors, timeout=15):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        for sel in selectors:
-            try:
-                if driver.is_element_present(sel):
-                    return sel
-            except Exception:
-                continue
-        time.sleep(0.5)
-    return None
-
-
-# ============================================================
-# LOGIN
-# ============================================================
-def login_to_cursor(driver, email, password):
-    cprint(Fore.CYAN, ">>", f"Logging in as {email}...")
-    try:
-        monitor_status["status"] = "login:opening_auth"
-        try:
-            driver.uc_open_with_reconnect(AUTH_URL, reconnect_time=6)
-        except Exception as e:
-            cprint(Fore.YELLOW, "..", f"uc_open fallback: {str(e)[:50]}")
-            driver.get(AUTH_URL)
-        time.sleep(3)
-
-        current = str(driver.current_url)
-        page_title = ""
-        try:
-            page_title = driver.execute_script("return document.title;") or ""
-        except Exception:
-            pass
-        cprint(Fore.CYAN, ">>", f"Auth page: {current[:60]} | title: {page_title[:40]}")
-        monitor_status["status"] = f"login:at_{current[:30]}"
-
-        if "cursor.com/dashboard" in current:
-            time.sleep(2)
-            try:
-                text = driver.execute_script("return document.body.innerText;") or ""
-                if "Team Plan" in text or "Overview" in text or "Settings" in text:
-                    cprint(Fore.GREEN, "OK", "Already logged in!")
-                    return True
-            except Exception:
-                pass
-            cprint(Fore.YELLOW, "!!", "Dashboard URL but not logged in, proceeding...")
-            driver.get(AUTH_URL)
-            time.sleep(3)
-
-        monitor_status["status"] = "login:solving_cf"
-        solve_cloudflare(driver, "login landing")
-
-        monitor_status["status"] = "login:finding_email"
-        email_sel = wait_for_any(driver, [
-            'input[name="email"]', 'input[type="email"]',
-        ], timeout=15)
-        if not email_sel:
-            solve_cloudflare(driver, "email page")
-            email_sel = wait_for_any(driver, [
-                'input[name="email"]', 'input[type="email"]',
-            ], timeout=10)
-        if not email_sel:
-            # Dump page info for debugging
-            try:
-                title = driver.execute_script("return document.title;") or ""
-                url = driver.current_url
-                body_text = (driver.execute_script("return document.body.innerText;") or "")[:200]
-                cprint(Fore.RED, "!!", f"Email field not found | URL: {url[:60]} | Title: {title} | Body: {body_text[:100]}")
-                monitor_status["last_error"] = f"No email field | {title} | {url[:60]}"
-            except Exception:
-                cprint(Fore.RED, "!!", "Email field not found (page unreadable)")
-                monitor_status["last_error"] = "No email field (page unreadable)"
-            return False
-
-        monitor_status["status"] = "login:typing_email"
-        driver.type(email_sel, email)
-        cprint(Fore.GREEN, "OK", f"Email: {email}")
-
-        cont = wait_for_any(driver, ['button[type="submit"]'], timeout=5)
-        if cont:
-            driver.click(cont)
-        else:
-            driver.execute_script("""
-                var btns = document.querySelectorAll('button');
-                for (var b of btns) { if (b.textContent.includes('Continue')) { b.click(); break; } }
-            """)
-        time.sleep(2)
-
-        monitor_status["status"] = "login:finding_password"
-        pw_sel = wait_for_any(driver, [
-            'input[name="password"]', 'input[type="password"]',
-        ], timeout=15)
-        if not pw_sel:
-            try:
-                title = driver.execute_script("return document.title;") or ""
-                url = driver.current_url
-                body_text = (driver.execute_script("return document.body.innerText;") or "")[:200]
-                cprint(Fore.RED, "!!", f"Password field not found | URL: {url[:60]} | Title: {title} | Body: {body_text[:100]}")
-                monitor_status["last_error"] = f"No password field | {title} | {url[:60]}"
-            except Exception:
-                cprint(Fore.RED, "!!", "Password field not found")
-                monitor_status["last_error"] = "No password field"
-            return False
-
-        monitor_status["status"] = "login:typing_password"
-        driver.type(pw_sel, password)
-        cprint(Fore.GREEN, "OK", "Password entered")
-
-        # Click Sign In normally (no disconnect — it resets the page)
-        monitor_status["status"] = "login:clicking_signin"
-        sign_sel = wait_for_any(driver, ['button[type="submit"]'], timeout=5)
-        if sign_sel:
-            driver.click(sign_sel)
-        else:
-            driver.execute_script("""
-                var btns = document.querySelectorAll('button');
-                for (var b of btns) {
-                    if (b.textContent.includes('Sign in')) { b.click(); break; }
-                }
-            """)
-        cprint(Fore.GREEN, "OK", "Sign In clicked")
-        monitor_status["status"] = "login:waiting_redirect"
-        time.sleep(5)
-
-        # Check result and handle CF/Turnstile
-        for w in range(30):
-            try:
-                url = driver.current_url
-            except Exception:
-                time.sleep(1)
-                continue
-
-            # Success: redirected to cursor.com
-            if "cursor.com" in url and "authenticator" not in url:
-                cprint(Fore.GREEN, "OK", f"Login success! {url}")
-                return True
-
-            if w == 0:
-                title = driver.execute_script("return document.title;") or ""
-                body = (driver.execute_script("return document.body.innerText;") or "")[:150]
-                cprint(Fore.CYAN, ">>", f"After sign-in: {url[:50]} | {title}")
-                cprint(Fore.CYAN, ">>", f"Body: {body[:100]}")
-                monitor_status["last_error"] = f"post-signin: {title} | {body[:80]}"
-
-            # Try to click Turnstile checkbox via iframe
-            if w in (2, 8, 15):
-                try:
-                    frames = driver.find_elements("css selector",
-                        'iframe[src*="turnstile"], iframe[src*="challenges"]')
-                    if frames:
-                        cprint(Fore.YELLOW, "CF", f"Found {len(frames)} CF iframe(s), clicking...")
-                        from selenium.webdriver.common.action_chains import ActionChains
-                        for frame in frames:
-                            try:
-                                ActionChains(driver).move_to_element(frame).click().perform()
-                                time.sleep(2)
-                            except Exception:
-                                pass
-                        # Also try switching into iframe
-                        try:
-                            driver.switch_to.frame(frames[0])
-                            driver.execute_script("""
-                                var cb = document.querySelector('input[type="checkbox"]');
-                                if (cb) cb.click();
-                                var spans = document.querySelectorAll('span');
-                                for (var s of spans) { s.click(); }
-                            """)
-                            driver.switch_to.default_content()
-                            time.sleep(3)
-                        except Exception:
-                            try:
-                                driver.switch_to.default_content()
-                            except Exception:
-                                pass
-                except Exception as e:
-                    cprint(Fore.YELLOW, "..", f"Turnstile click err: {str(e)[:40]}")
-
-            # Check for wrong credentials
-            if w == 5:
-                try:
-                    body = (driver.execute_script("return document.body.innerText;") or "").lower()
-                    if "incorrect" in body or "invalid" in body:
-                        cprint(Fore.RED, "!!", "Wrong credentials!")
-                        monitor_status["last_error"] = "Wrong credentials"
-                        return False
-                except Exception:
-                    pass
-
-            # At 20s, try direct dashboard nav as fallback
-            if w == 20:
-                monitor_status["status"] = "login:try_direct_nav"
-                cprint(Fore.CYAN, ">>", "Trying direct dashboard nav...")
-                try:
-                    driver.get(DASHBOARD_URL)
-                    time.sleep(3)
-                    url = driver.current_url
-                    if "cursor.com" in url and "authenticator" not in url:
-                        text = driver.execute_script("return document.body.innerText;") or ""
-                        if any(k in text for k in ["Team Plan", "Overview", "Settings", "Usage"]):
-                            cprint(Fore.GREEN, "OK", f"Login success (direct)! {url}")
-                            return True
-                except Exception:
-                    pass
-
-            time.sleep(1)
-
-        try:
-            final_url = driver.current_url
-            title = driver.execute_script("return document.title;") or ""
-            body_text = (driver.execute_script("return document.body.innerText;") or "")[:300]
-            cprint(Fore.RED, "!!", f"Login timeout | URL: {final_url[:60]} | Title: {title}")
-            cprint(Fore.RED, "!!", f"Body: {body_text[:200]}")
-            monitor_status["last_error"] = f"Timeout | {title} | {body_text[:150]}"
-        except Exception:
-            final_url = "unknown"
-            monitor_status["last_error"] = f"Timeout at {final_url}"
-        return False
-    except Exception as e:
-        cprint(Fore.RED, "!!", f"Login error: {e}")
-        monitor_status["last_error"] = f"Login error: {str(e)[:100]}"
-        return False
-
-
-# ============================================================
-# TEAM STATUS & INVITE LINK
-# ============================================================
-def check_team_status(driver):
-    try:
-        driver.get(DASHBOARD_URL)
-        time.sleep(3)
-        url = str(driver.current_url)
-        if "authenticator" in url or "login" in url:
-            return "logged_out", "Redirected to login"
-        text = driver.execute_script("return document.body.innerText;") or ""
-        if "Team Plan" in text:
-            return "active", "Team Plan"
-        if "Free" in text and "Plan" in text:
-            return "free_plan", "Free plan"
-        driver.get(MEMBERS_URL)
-        time.sleep(2)
-        if "members" not in str(driver.current_url):
-            return "removed", "Redirected from members"
-        has_invite = driver.execute_script("""
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) { if (b.textContent.includes('Invite')) return true; }
-            return false;
-        """)
-        if has_invite:
-            return "active", "Members page OK"
-        return "active", "Members accessible"
-    except Exception as e:
-        return "logged_out", str(e)
-
-
-def extract_invite_link(driver):
-    try:
-        if "members" not in str(driver.current_url):
-            driver.get(MEMBERS_URL)
-            time.sleep(3)
-            solve_cloudflare(driver, "members")
-
-        invite_clicked = driver.execute_script("""
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                if (b.textContent.trim() === 'Invite' || b.textContent.includes('Invite')) {
-                    b.click(); return true;
-                }
-            }
-            return false;
-        """)
-        if not invite_clicked:
-            cprint(Fore.RED, "!!", "Invite button not found")
-            return None
-        time.sleep(1.5)
-
-        link = driver.execute_script("""
-            return new Promise((resolve, reject) => {
-                const orig = navigator.clipboard.writeText.bind(navigator.clipboard);
-                navigator.clipboard.writeText = async (text) => {
-                    resolve(text);
-                    navigator.clipboard.writeText = orig;
-                    return orig(text);
-                };
-                var btns = document.querySelectorAll('button');
-                for (var b of btns) {
-                    if (b.textContent.includes('Copy Invite Link') || b.textContent.includes('Copy invite link')) {
-                        b.click(); break;
-                    }
-                }
-                setTimeout(() => reject(new Error('timeout')), 5000);
-            });
-        """)
-        if link and "cursor.com" in link:
-            cprint(Fore.GREEN, "OK", f"Link: {link.strip()}")
-            return link.strip()
-    except Exception as e:
-        cprint(Fore.YELLOW, "!!", f"Clipboard failed: {e}")
-
-    try:
-        src = driver.get_page_source()
-        m = re.search(r'https://cursor\.com/team/accept-invite\?code=[a-f0-9]+', src)
-        if m:
-            cprint(Fore.GREEN, "OK", f"Link (HTML): {m.group(0)}")
-            return m.group(0)
-    except Exception:
-        pass
-
-    try:
-        link = driver.execute_script("""
-            var w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-            while (w.nextNode()) {
-                var m = w.currentNode.textContent.match(/https:\\/\\/cursor\\.com\\/team\\/accept-invite\\?code=[a-f0-9]+/);
-                if (m) return m[0];
-            }
-            return null;
-        """)
-        if link:
-            return link
-    except Exception:
-        pass
-
-    return None
-
-
-def close_modal(driver):
-    try:
-        driver.execute_script("""
-            var btns = document.querySelectorAll('button[aria-label="Close"], [class*="close"]');
-            for (var b of btns) { var el = b.closest('button'); if (el) { el.click(); return; } }
-            var bds = document.querySelectorAll('[class*="backdrop"], [class*="overlay"]');
-            for (var bd of bds) { bd.click(); return; }
-        """)
-        time.sleep(0.3)
-    except Exception:
-        pass
-
-
-def auto_join_invite(driver, link):
-    cprint(Fore.CYAN, ">>", f"Joining: {link}")
-    try:
-        driver.get(link)
-        time.sleep(3)
-        solve_cloudflare(driver, "invite")
-        text = (driver.execute_script("return document.body.innerText;") or "").lower()
-        if "already" in text and "member" in text:
-            cprint(Fore.GREEN, "OK", "Already a member!")
-            return True
-        joined = driver.execute_script("""
-            var btns = document.querySelectorAll('button');
-            for (var b of btns) {
-                var t = b.textContent.toLowerCase();
-                if (t.includes('accept') || t.includes('join')) { b.click(); return true; }
-            }
-            return false;
-        """)
-        if joined:
-            time.sleep(3)
-            cprint(Fore.GREEN, "OK", "Joined!")
-            return True
-        return False
-    except Exception as e:
-        cprint(Fore.RED, "!!", f"Join error: {e}")
-        return False
-
-
-# ============================================================
-# HEALTH SERVER
+# HEALTH SERVER + DASHBOARD
 # ============================================================
 monitor_status = {
     "started": None, "last_check": None, "checks": 0,
     "link_changes": 0, "current_link": "", "status": "starting",
-    "errors": 0, "last_error": "",
+    "errors": 0, "last_error": "", "session_valid": False,
 }
-link_history_log = []  # In-memory log: [{time, old, new}, ...]
-
+link_history_log = []
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Cursor Monitor</title>
@@ -655,9 +390,12 @@ td a{{color:#58a6ff;text-decoration:none}}
 .badge.running{{background:#0d2818;color:#3fb950}}
 .badge.starting{{background:#2d2200;color:#d29922}}
 .badge.error{{background:#2d0f0f;color:#f85149}}
-.badge.login{{background:#1a1a3e;color:#bc8cff}}
+.badge.expired{{background:#2d0f0f;color:#f85149}}
+.alert{{background:#2d0f0f;border:1px solid #f85149;border-radius:8px;padding:16px;margin-bottom:16px;color:#f85149}}
 </style></head><body>
-<h1>Cursor Invite Link Monitor</h1>
+<h1>Cursor Invite Link Monitor v7</h1>
+
+{alert_html}
 
 <div class="card">
 <h2>Status</h2>
@@ -690,20 +428,21 @@ td a{{color:#58a6ff;text-decoration:none}}
 </div>
 </div>
 
-<p style="color:#8b949e;font-size:11px;margin-top:20px;text-align:center">Auto-refreshes every 10 seconds | <a href="/api" style="color:#58a6ff">JSON API</a></p>
+<p style="color:#8b949e;font-size:11px;margin-top:20px;text-align:center">
+v7 HTTP mode | Auto-refreshes every 10s | <a href="/api" style="color:#58a6ff">JSON API</a>
+</p>
 </body></html>"""
 
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/api" or self.path == "/health" or self.path == "/ping":
+        if self.path in ("/api", "/health", "/ping"):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             data = {**monitor_status, "history": link_history_log[-20:]}
             self.wfile.write(json.dumps(data, indent=2, default=str).encode())
         else:
-            # Dashboard HTML
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -712,9 +451,9 @@ class HealthHandler(BaseHTTPRequestHandler):
                 status_text = s["status"]
                 if "running" in status_text:
                     badge = '<span class="badge running">RUNNING</span>'
-                elif "login" in status_text:
-                    badge = f'<span class="badge login">{status_text}</span>'
-                elif "error" in status_text or "fail" in status_text:
+                elif "expired" in status_text:
+                    badge = f'<span class="badge expired">SESSION EXPIRED</span>'
+                elif "error" in status_text:
                     badge = f'<span class="badge error">{status_text}</span>'
                 else:
                     badge = f'<span class="badge starting">{status_text}</span>'
@@ -727,9 +466,12 @@ class HealthHandler(BaseHTTPRequestHandler):
 
                 last_check = s.get("last_check", "Never")
                 if last_check and last_check != "Never":
-                    last_check = last_check[:19].replace("T", " ")
+                    last_check = str(last_check)[:19].replace("T", " ")
 
-                # History table
+                alert_html = ""
+                if not s.get("session_valid", True):
+                    alert_html = '<div class="alert"><strong>Session Expired!</strong> Run <code>python get_cookies.py</code> locally and update the SESSION_COOKIES env var on Render.</div>'
+
                 history = link_history_log[-20:]
                 if history:
                     rows = ""
@@ -747,6 +489,7 @@ class HealthHandler(BaseHTTPRequestHandler):
                 last_err_short = (last_err[:50] + "...") if len(last_err) > 50 else last_err
 
                 html = DASHBOARD_HTML.format(
+                    alert_html=alert_html,
                     status_badge=badge,
                     checks=s["checks"],
                     link_changes=s["link_changes"],
@@ -771,209 +514,243 @@ class HealthHandler(BaseHTTPRequestHandler):
 def start_health_server():
     port = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    cprint(Fore.CYAN, ">>", f"Health server on :{port}")
+    cprint(">>", f"Health server on :{port}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
 
 # ============================================================
 # MONITOR LOOP
 # ============================================================
-def monitor_account(account, cfg):
-    name = account.get("name", account["cursor_email"])
-    email = account["cursor_email"]
-    password = account["cursor_password"]
+def monitor_account(account, cfg, cookies):
+    name = account.get("name", account.get("cursor_email", "Main"))
     known_link = account.get("known_invite_link", "")
     interval = cfg.get("check_interval_seconds", 5)
     history = load_history()
 
-    cprint(Fore.CYAN, "==", f"Monitor: {name} | {interval}s interval")
+    cprint("==", f"Monitor: {name} | {interval}s interval | HTTP mode")
+
+    http = CursorHTTP(cookies)
+
+    # Initial session check
+    monitor_status["status"] = "checking_session"
+    valid, detail = http.check_session()
+    if not valid:
+        cprint("!!", f"Session invalid: {detail}")
+        monitor_status["status"] = "session_expired"
+        monitor_status["session_valid"] = False
+        monitor_status["last_error"] = f"Session invalid: {detail}. Run get_cookies.py locally!"
+        send_email(cfg, f"SESSION EXPIRED - {name}",
+            "<h2>Session Expired!</h2>"
+            "<p>Run <code>python get_cookies.py</code> on your computer, "
+            "then update SESSION_COOKIES env var on Render.</p>")
+        # Keep server running so dashboard shows the error
+        while True:
+            time.sleep(60)
+            # Re-check in case cookies were updated via env var
+            new_cookies = load_cookies()
+            if new_cookies != cookies:
+                cprint(">>", "New cookies detected, retrying...")
+                cookies = new_cookies
+                http = CursorHTTP(cookies)
+                valid, detail = http.check_session()
+                if valid:
+                    cprint("OK", "Session restored!")
+                    monitor_status["session_valid"] = True
+                    break
+    else:
+        cprint("OK", f"Session valid! ({detail})")
+        monitor_status["session_valid"] = True
+
+    # Check team status
+    monitor_status["status"] = "checking_team"
+    status, detail = http.get_team_status()
+    cprint(">>", f"Team: {status} ({detail})")
+
+    if status in ("removed", "free_plan"):
+        cprint("!!", "NOT ON TEAM!")
+        send_email(cfg, f"REMOVED FROM TEAM - {name}",
+            f"<h2>Removed from team!</h2><p>Status: {status} ({detail})</p>")
+
+    # Initial invite link extraction
+    monitor_status["status"] = "extracting_link"
+    link, code = http.get_invite_link()
+    if link:
+        cprint("OK", f"Invite link: {link}")
+        if link != known_link:
+            known_link = link
+            account["known_invite_link"] = link
+            save_config(cfg)
+    else:
+        cprint("..", "No invite link in HTML, trying API...")
+        api_link = http.try_get_invite_via_api()
+        if api_link:
+            link = api_link
+            known_link = link
+            account["known_invite_link"] = link
+            save_config(cfg)
+
+    if not link and known_link:
+        cprint("..", f"Using known link from config: {known_link}")
+        link = known_link
+
+    monitor_status["current_link"] = known_link or ""
+    monitor_status["status"] = "running"
+    check_count = 0
+    consecutive_errors = 0
+    last_session_check = time.time()
+
+    cprint("OK", "Monitoring started!")
+    cprint(">>", f"Known link: {known_link or 'none'}")
 
     while True:
-        driver = None
-        try:
-            monitor_status["status"] = "creating_browser"
-            driver = create_browser()
+        time.sleep(interval)
+        check_count += 1
 
-            monitor_status["status"] = "logging_in"
-            for attempt in range(5):
-                if login_to_cursor(driver, email, password):
-                    break
-                monitor_status["status"] = f"login_retry_{attempt+1}"
-                cprint(Fore.YELLOW, "..", f"Retry {attempt+1}/5 in 10s...")
-                time.sleep(10)
-            else:
-                monitor_status["status"] = "login_failed"
-                monitor_status["errors"] += 1
-                quit_browser(driver)
-                time.sleep(60)
+        try:
+            # Periodic session validity check (every 2 min)
+            if time.time() - last_session_check > 120:
+                valid, detail = http.check_session()
+                last_session_check = time.time()
+                if not valid:
+                    cprint("!!", f"Session expired: {detail}")
+                    monitor_status["status"] = "session_expired"
+                    monitor_status["session_valid"] = False
+                    monitor_status["last_error"] = f"Session expired: {detail}"
+                    send_email(cfg, f"SESSION EXPIRED - {name}",
+                        "<h2>Session Expired!</h2>"
+                        "<p>Run get_cookies.py locally and update SESSION_COOKIES on Render.</p>")
+                    # Wait for new cookies
+                    while True:
+                        time.sleep(60)
+                        new_cookies = load_cookies()
+                        http = CursorHTTP(new_cookies)
+                        valid, _ = http.check_session()
+                        if valid:
+                            cprint("OK", "Session restored!")
+                            monitor_status["session_valid"] = True
+                            monitor_status["status"] = "running"
+                            last_session_check = time.time()
+                            break
+                    continue
+
+            # Get invite link
+            new_link, code = http.get_invite_link()
+
+            if code == 401:
+                # Session expired during check
+                monitor_status["status"] = "session_expired"
+                monitor_status["session_valid"] = False
+                last_session_check = 0  # Force re-check
                 continue
 
-            status, detail = check_team_status(driver)
-            cprint(Fore.CYAN, ">>", f"Status: {status} ({detail})")
+            monitor_status["last_check"] = datetime.now().isoformat()
+            monitor_status["checks"] = check_count
 
-            if status in ("removed", "free_plan"):
-                cprint(Fore.RED, "!!", "REMOVED!")
-                send_email(cfg, f"REMOVED - {name}",
-                    f"<h2>Removed!</h2><p>{email}</p><p>Trying: {known_link}</p>")
-                if known_link:
-                    auto_join_invite(driver, known_link)
-                    time.sleep(3)
-                    status, _ = check_team_status(driver)
+            if new_link is None:
+                consecutive_errors += 1
+                if consecutive_errors >= 10:
+                    # Try API fallback
+                    api_link = http.try_get_invite_via_api()
+                    if api_link:
+                        new_link = api_link
+                        consecutive_errors = 0
+                    else:
+                        cprint("..", f"#{check_count}: No link found ({consecutive_errors} consecutive)")
+                if consecutive_errors >= 30:
+                    cprint("!!", "Too many consecutive failures, checking session...")
+                    last_session_check = 0
+                    consecutive_errors = 0
+                continue
 
-            if status == "active":
-                current = extract_invite_link(driver)
-                if current and current != known_link:
-                    known_link = current
-                    account["known_invite_link"] = current
-                    save_config(cfg)
+            consecutive_errors = 0
+            monitor_status["current_link"] = new_link
 
-            monitor_status["status"] = "running"
-            monitor_status["current_link"] = known_link
-            check_count = 0
-            fails = 0
-            last_relogin = time.time()
-            last_status = time.time()
+            # LINK CHANGED!
+            if new_link != known_link and known_link:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+                cprint("!!", "=" * 50)
+                cprint("!!", f"LINK CHANGED at {now}")
+                cprint("<<", f"OLD: {known_link}")
+                cprint(">>", f"NEW: {new_link}")
+                cprint("!!", "=" * 50)
 
-            while True:
-                time.sleep(interval)
-                check_count += 1
-                try:
-                    if time.time() - last_status > 120:
-                        st, dt = check_team_status(driver)
-                        last_status = time.time()
-                        if st == "logged_out":
-                            login_to_cursor(driver, email, password)
-                            last_relogin = time.time()
-                            continue
-                        if st in ("removed", "free_plan"):
-                            send_email(cfg, f"REMOVED - {name}",
-                                f"<h2>Removed!</h2><p>{email}</p>")
-                            if known_link:
-                                auto_join_invite(driver, known_link)
-                            login_to_cursor(driver, email, password)
-                            last_relogin = time.time()
-                            continue
+                record = {
+                    "timestamp": now, "account": name,
+                    "old_link": known_link, "new_link": new_link,
+                    "check_number": check_count,
+                }
+                history.append(record)
+                save_history(history)
+                monitor_status["link_changes"] += 1
+                link_history_log.append({"time": now, "old": known_link, "new": new_link})
 
-                    if time.time() - last_relogin > 1500:
-                        login_to_cursor(driver, email, password)
-                        last_relogin = time.time()
+                known_link = new_link
+                account["known_invite_link"] = new_link
+                save_config(cfg)
 
-                    close_modal(driver)
-                    driver.get(MEMBERS_URL)
-                    time.sleep(2)
-                    solve_cloudflare(driver, "refresh")
+                send_email(cfg, f"LINK CHANGED - {name}",
+                    f"<h2>Invite Link Changed!</h2>"
+                    f"<table border='1' cellpadding='8'>"
+                    f"<tr><td><b>Time</b></td><td>{now}</td></tr>"
+                    f"<tr><td><b>Old</b></td><td>{record['old_link']}</td></tr>"
+                    f"<tr><td><b>New</b></td><td><a href='{new_link}'>{new_link}</a></td></tr>"
+                    f"</table><br>"
+                    f"<a href='{new_link}' style='background:#4CAF50;color:white;padding:12px 24px;"
+                    f"text-decoration:none;border-radius:5px;'>Join Now</a>")
 
-                    new_link = extract_invite_link(driver)
+            elif not known_link and new_link:
+                known_link = new_link
+                account["known_invite_link"] = new_link
+                save_config(cfg)
 
-                    if new_link is None:
-                        fails += 1
-                        if fails >= 5:
-                            st, _ = check_team_status(driver)
-                            if st == "logged_out":
-                                login_to_cursor(driver, email, password)
-                                last_relogin = time.time()
-                            elif st in ("removed", "free_plan"):
-                                if known_link:
-                                    auto_join_invite(driver, known_link)
-                                login_to_cursor(driver, email, password)
-                                last_relogin = time.time()
-                            fails = 0
-                        continue
-
-                    fails = 0
-                    monitor_status["last_check"] = datetime.now().isoformat()
-                    monitor_status["checks"] = check_count
-                    monitor_status["current_link"] = new_link
-
-                    if new_link != known_link and known_link:
-                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-                        cprint(Fore.GREEN, "!!", "=" * 50)
-                        cprint(Fore.GREEN, "!!", f"LINK CHANGED at {now}")
-                        cprint(Fore.RED, "<<", f"OLD: {known_link}")
-                        cprint(Fore.GREEN, ">>", f"NEW: {new_link}")
-                        cprint(Fore.GREEN, "!!", "=" * 50)
-
-                        record = {"timestamp": now, "account": email,
-                                  "old_link": known_link, "new_link": new_link,
-                                  "check_number": check_count}
-                        history.append(record)
-                        save_history(history)
-                        monitor_status["link_changes"] += 1
-                        link_history_log.append({
-                            "time": now, "old": known_link, "new": new_link
-                        })
-
-                        known_link = new_link
-                        account["known_invite_link"] = new_link
-                        save_config(cfg)
-
-                        send_email(cfg, f"LINK CHANGED - {name}",
-                            f"<h2>Link Changed!</h2>"
-                            f"<table border='1' cellpadding='8'>"
-                            f"<tr><td><b>Time</b></td><td>{now}</td></tr>"
-                            f"<tr><td><b>Old</b></td><td>{record['old_link']}</td></tr>"
-                            f"<tr><td><b>New</b></td><td><a href='{new_link}'>{new_link}</a></td></tr>"
-                            f"</table><br>"
-                            f"<a href='{new_link}' style='background:#4CAF50;color:white;padding:12px 24px;"
-                            f"text-decoration:none;border-radius:5px;'>Join Now</a>")
-
-                        if account.get("auto_join", True):
-                            auto_join_invite(driver, new_link)
-
-                    elif not known_link and new_link:
-                        known_link = new_link
-                        account["known_invite_link"] = new_link
-                        save_config(cfg)
-
-                    if check_count % 100 == 0:
-                        cprint(Fore.CYAN, ">>", f"#{check_count}: OK")
-
-                except KeyboardInterrupt:
-                    raise
-                except Exception as e:
-                    cprint(Fore.RED, "!!", f"#{check_count}: {e}")
-                    monitor_status["last_error"] = str(e)
-                    monitor_status["errors"] += 1
-                    fails += 1
+            if check_count % 200 == 0:
+                cprint(">>", f"#{check_count}: OK | Link: ...{(known_link or '')[-20:]}")
 
         except KeyboardInterrupt:
-            cprint(Fore.YELLOW, "!!", "Stopped")
-            break
+            raise
         except Exception as e:
-            cprint(Fore.RED, "!!", f"Fatal: {e} - restart 30s...")
-            monitor_status["last_error"] = str(e)
+            cprint("!!", f"#{check_count}: {e}")
+            monitor_status["last_error"] = str(e)[:100]
             monitor_status["errors"] += 1
-            time.sleep(30)
-        finally:
-            if driver:
-                quit_browser(driver)
+            consecutive_errors += 1
 
 
 def main():
-    print(f"\n{Fore.CYAN}{'='*60}")
-    print(f"{Fore.CYAN}  CURSOR INVITE LINK MONITOR v6")
-    print(f"{Fore.CYAN}  SeleniumBase UC | Xvfb Docker | Auto-Rejoin")
-    print(f"{Fore.CYAN}{'='*60}\n")
+    print(f"\n{'='*60}")
+    print(f"  CURSOR INVITE LINK MONITOR v7")
+    print(f"  Pure HTTP Mode | No Browser | No Cloudflare")
+    print(f"{'='*60}\n")
 
     start_health_server()
     monitor_status["started"] = datetime.now().isoformat()
 
     cfg = load_config()
-    accounts = [a for a in cfg.get("accounts", []) if a.get("enabled", True)]
+    cookies = load_cookies()
 
+    if not cookies:
+        cprint("!!", "NO COOKIES! Set SESSION_COOKIES env var or run get_cookies.py locally.")
+        monitor_status["status"] = "no_cookies"
+        monitor_status["last_error"] = "No session cookies. Run get_cookies.py locally!"
+        # Keep server alive so dashboard shows the error
+        while True:
+            time.sleep(60)
+            cookies = load_cookies()
+            if cookies:
+                break
+
+    accounts = [a for a in cfg.get("accounts", []) if a.get("enabled", True)]
     if not accounts:
-        cprint(Fore.RED, "!!", "No accounts!")
-        return
+        accounts = [{"name": "Main", "known_invite_link": os.environ.get("KNOWN_INVITE_LINK", "")}]
 
     if len(accounts) == 1:
-        monitor_account(accounts[0], cfg)
+        monitor_account(accounts[0], cfg, cookies)
     else:
         threads = []
         for acc in accounts:
-            t = threading.Thread(target=monitor_account, args=(acc, cfg), daemon=True)
+            t = threading.Thread(target=monitor_account, args=(acc, cfg, cookies), daemon=True)
             t.start()
             threads.append(t)
-            time.sleep(3)
+            time.sleep(1)
         try:
             for t in threads:
                 t.join()

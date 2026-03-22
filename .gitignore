@@ -7,3 +7,6 @@ test_run.py
 cursor_checker.py
 gui_checker.py
 config.json
+cookies.json
+downloaded_files/
+.claude/

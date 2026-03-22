@@ -1,4 +1,1 @@
-seleniumbase
-colorama
-pyautogui
-python-xlib
+requests

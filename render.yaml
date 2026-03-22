@@ -1,8 +1,8 @@
 # Deploy to Render.com
 # 1. Push this repo to GitHub
-# 2. Go to render.com → New → Web Service (not background worker, so UptimeRobot can ping)
+# 2. Go to render.com → New → Web Service
 # 3. Connect your GitHub repo
-# 4. Set environment variables below
+# 4. Set SESSION_COOKIES env var with your cookies JSON
 
 services:
   - type: web
@@ -14,11 +14,7 @@ services:
         value: "1"
       - key: PORT
         value: "10000"
-      - key: CURSOR_EMAIL
-        sync: false
-      - key: CURSOR_PASSWORD
-        sync: false
-      - key: KNOWN_INVITE_LINK
+      - key: SESSION_COOKIES
         sync: false
       - key: NOTIFICATION_EMAIL
         sync: false
@@ -28,3 +24,5 @@ services:
         value: "5"
       - key: ACCOUNT_NAME
         value: "Adrian Max - Hanwha Team"
+      - key: KNOWN_INVITE_LINK
+        sync: false
