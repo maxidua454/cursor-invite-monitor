@@ -398,6 +398,18 @@ def login_to_cursor(driver, email, password):
 
         monitor_status["status"] = "login:checking_result"
 
+        # Dump page info right after reconnect
+        try:
+            url = driver.current_url
+            title = driver.execute_script("return document.title;") or ""
+            body = (driver.execute_script("return document.body.innerText;") or "")[:200]
+            cprint(Fore.CYAN, ">>", f"After reconnect URL: {url[:60]}")
+            cprint(Fore.CYAN, ">>", f"Title: {title}")
+            cprint(Fore.CYAN, ">>", f"Body: {body[:100]}")
+            monitor_status["last_error"] = f"post-reconnect: {title} | {body[:80]}"
+        except Exception as e:
+            cprint(Fore.YELLOW, "..", f"Page read err: {str(e)[:40]}")
+
         # Check if we landed on dashboard
         for w in range(15):
             try:
@@ -447,14 +459,13 @@ def login_to_cursor(driver, email, password):
         try:
             final_url = driver.current_url
             title = driver.execute_script("return document.title;") or ""
-            body_text = (driver.execute_script("return document.body.innerText;") or "")[:200]
+            body_text = (driver.execute_script("return document.body.innerText;") or "")[:300]
             cprint(Fore.RED, "!!", f"Login timeout | URL: {final_url[:60]} | Title: {title}")
-            cprint(Fore.RED, "!!", f"Body: {body_text[:150]}")
+            cprint(Fore.RED, "!!", f"Body: {body_text[:200]}")
+            monitor_status["last_error"] = f"Timeout | {title} | {body_text[:150]}"
         except Exception:
             final_url = "unknown"
-
-        cprint(Fore.RED, "!!", f"Login timeout at {final_url[:60]}")
-        monitor_status["last_error"] = f"Timeout at {final_url[:60]}"
+            monitor_status["last_error"] = f"Timeout at {final_url}"
         return False
     except Exception as e:
         cprint(Fore.RED, "!!", f"Login error: {e}")
