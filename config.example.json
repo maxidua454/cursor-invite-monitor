@@ -1,0 +1,18 @@
+{
+    "accounts": [
+        {
+            "name": "My Team",
+            "cursor_email": "YOUR_EMAIL",
+            "cursor_password": "YOUR_PASSWORD",
+            "known_invite_link": "",
+            "auto_join": true,
+            "enabled": true
+        }
+    ],
+
+    "notification_email": "YOUR_GMAIL@gmail.com",
+    "gmail_app_password": "YOUR_GMAIL_APP_PASSWORD",
+
+    "check_interval_seconds": 5,
+    "headless": true
+}

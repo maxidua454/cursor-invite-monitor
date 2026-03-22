@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.log
+login_error.png
+link_history.json
+test_run.py
+cursor_checker.py
+gui_checker.py
+config.json

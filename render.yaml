@@ -1,0 +1,30 @@
+# Deploy to Render.com
+# 1. Push this repo to GitHub
+# 2. Go to render.com → New → Web Service (not background worker, so UptimeRobot can ping)
+# 3. Connect your GitHub repo
+# 4. Set environment variables below
+
+services:
+  - type: web
+    name: cursor-invite-monitor
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PORT
+        value: "10000"
+      - key: CURSOR_EMAIL
+        sync: false
+      - key: CURSOR_PASSWORD
+        sync: false
+      - key: KNOWN_INVITE_LINK
+        sync: false
+      - key: NOTIFICATION_EMAIL
+        sync: false
+      - key: GMAIL_APP_PASSWORD
+        sync: false
+      - key: CHECK_INTERVAL
+        value: "5"
+      - key: ACCOUNT_NAME
+        value: "Adrian Max - Hanwha Team"
