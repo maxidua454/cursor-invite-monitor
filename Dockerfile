@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y \
     libx11-xcb1 libxcb1 libxext6 libxfixes3 \
     libxi6 libxrender1 libxtst6 libxss1 \
     fonts-liberation xdg-utils ca-certificates \
+    xdotool python3-xlib \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Google Chrome

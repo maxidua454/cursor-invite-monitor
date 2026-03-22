@@ -1,2 +1,4 @@
 seleniumbase
 colorama
+pyautogui
+python-xlib

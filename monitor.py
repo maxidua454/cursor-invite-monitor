@@ -358,18 +358,11 @@ def login_to_cursor(driver, email, password):
         driver.type(pw_sel, password)
         cprint(Fore.GREEN, "OK", "Password entered")
 
-        # Use uc_click for Sign In — disconnects Chrome before click
-        # so Cloudflare can't detect automation during the redirect
+        # Click Sign In
         monitor_status["status"] = "login:clicking_signin"
         sign_sel = wait_for_any(driver, ['button[type="submit"]'], timeout=5)
         if sign_sel:
-            try:
-                driver.uc_click(sign_sel, reconnect_time=8)
-                cprint(Fore.GREEN, "OK", "Sign In via uc_click (CF bypass)")
-            except Exception as e:
-                cprint(Fore.YELLOW, "..", f"uc_click failed: {str(e)[:40]}, using JS click")
-                driver.click(sign_sel)
-                time.sleep(3)
+            driver.click(sign_sel)
         else:
             driver.execute_script("""
                 var btns = document.querySelectorAll('button');
@@ -377,44 +370,100 @@ def login_to_cursor(driver, email, password):
                     if (b.textContent.includes('Sign in')) { b.click(); break; }
                 }
             """)
-            time.sleep(3)
         cprint(Fore.GREEN, "OK", "Sign In clicked")
         monitor_status["status"] = "login:waiting_redirect"
+        time.sleep(3)
 
-        time.sleep(2)
-
-        # Check if redirected to dashboard
-        for w in range(20):
-            try:
-                url = driver.current_url
-            except Exception:
-                time.sleep(1)
-                continue
+        # Check if already redirected
+        try:
+            url = driver.current_url
             if "cursor.com" in url and "authenticator" not in url:
                 cprint(Fore.GREEN, "OK", f"Login success! {url}")
                 return True
-            if w == 5:
-                # Try solving CF if still stuck
-                solve_cloudflare(driver, "post-signin")
-            if w == 10:
-                # Try direct dashboard nav
-                monitor_status["status"] = "login:try_direct_nav"
-                cprint(Fore.CYAN, ">>", "Trying direct nav to dashboard...")
-                try:
-                    driver.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=6)
-                except Exception:
-                    driver.get(DASHBOARD_URL)
-                time.sleep(2)
-                solve_cloudflare(driver, "dashboard")
-                try:
+        except Exception:
+            pass
+
+        # Check for Turnstile widget and try to solve it
+        monitor_status["status"] = "login:solving_turnstile"
+        cprint(Fore.CYAN, ">>", "Checking for Turnstile challenge...")
+
+        for ts_attempt in range(3):
+            try:
+                has_turnstile = driver.execute_script("""
+                    return document.querySelector('iframe[src*="turnstile"]') !== null
+                        || document.querySelector('#cf-turnstile') !== null
+                        || document.querySelector('[class*="turnstile"]') !== null
+                        || document.title.includes('Just a moment');
+                """)
+                if not has_turnstile:
+                    # No Turnstile, check if we redirected
                     url = driver.current_url
                     if "cursor.com" in url and "authenticator" not in url:
-                        text = driver.execute_script("return document.body.innerText;") or ""
-                        if any(k in text for k in ["Team Plan", "Overview", "Settings", "Usage"]):
-                            cprint(Fore.GREEN, "OK", f"Login success (direct nav)! {url}")
-                            return True
-                except Exception:
-                    pass
+                        cprint(Fore.GREEN, "OK", f"Login success! {url}")
+                        return True
+                    # Maybe credentials were wrong or page is processing
+                    cprint(Fore.YELLOW, "..", f"No Turnstile, still at {url[:50]}")
+                    time.sleep(2)
+                    continue
+
+                cprint(Fore.YELLOW, "CF", f"Turnstile detected (attempt {ts_attempt+1}/3)")
+
+                # Method 1: uc_gui_click_captcha (physical click via xdotool)
+                try:
+                    driver.uc_gui_click_captcha()
+                    time.sleep(4)
+                    url = driver.current_url
+                    if "cursor.com" in url and "authenticator" not in url:
+                        cprint(Fore.GREEN, "OK", f"Login success (gui click)! {url}")
+                        return True
+                    cprint(Fore.CYAN, ">>", f"After gui_click: {url[:50]}")
+                except Exception as e:
+                    cprint(Fore.YELLOW, "..", f"gui_click err: {str(e)[:50]}")
+
+                # Method 2: reconnect trick
+                try:
+                    safe_reconnect(driver, 8)
+                    time.sleep(2)
+                    url = driver.current_url
+                    if "cursor.com" in url and "authenticator" not in url:
+                        cprint(Fore.GREEN, "OK", f"Login success (reconnect)! {url}")
+                        return True
+                except Exception as e:
+                    cprint(Fore.YELLOW, "..", f"reconnect err: {str(e)[:40]}")
+
+            except Exception as e:
+                cprint(Fore.YELLOW, "..", f"Turnstile attempt err: {str(e)[:50]}")
+                time.sleep(2)
+
+        # Fallback: try direct nav to dashboard
+        monitor_status["status"] = "login:try_direct_nav"
+        cprint(Fore.CYAN, ">>", "Trying direct nav to dashboard...")
+        try:
+            driver.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=6)
+        except Exception:
+            driver.get(DASHBOARD_URL)
+        time.sleep(3)
+        solve_cloudflare(driver, "dashboard")
+
+        try:
+            url = driver.current_url
+            if "cursor.com" in url and "authenticator" not in url:
+                text = driver.execute_script("return document.body.innerText;") or ""
+                if any(k in text for k in ["Team Plan", "Overview", "Settings", "Usage"]):
+                    cprint(Fore.GREEN, "OK", f"Login success (direct nav)! {url}")
+                    return True
+        except Exception:
+            pass
+
+        # Brief wait
+        for w in range(10):
+            try:
+                url = driver.current_url
+                if "cursor.com" in url and "authenticator" not in url:
+                    cprint(Fore.GREEN, "OK", f"Login success! {url}")
+                    return True
+            except Exception:
+                pass
             time.sleep(1)
 
         try:
