@@ -602,6 +602,12 @@ class HealthHandler(BaseHTTPRequestHandler):
                 err_html = f'<html><body style="background:#0d1117;color:#f85149;padding:40px;font-family:monospace"><h1>Dashboard Error</h1><pre>{e}</pre></body></html>'
                 self.wfile.write(err_html.encode())
 
+    def do_HEAD(self):
+        """Handle HEAD requests (used by UptimeRobot and other monitors)."""
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+
     def log_message(self, *a):
         pass
 
