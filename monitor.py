@@ -358,94 +358,93 @@ def login_to_cursor(driver, email, password):
         driver.type(pw_sel, password)
         cprint(Fore.GREEN, "OK", "Password entered")
 
-        # KEY TRICK: Schedule Sign In click via setTimeout, then disconnect
-        # Chrome before it fires. When the click happens, Chrome is disconnected
-        # from Selenium so Cloudflare can't detect automation during the redirect.
+        # Click Sign In normally (no disconnect — it resets the page)
         monitor_status["status"] = "login:clicking_signin"
-        cprint(Fore.CYAN, ">>", "Scheduling Sign In click + disconnect...")
-
-        # Schedule the click to fire in 1 second
-        driver.execute_script("""
-            setTimeout(function() {
-                var btn = document.querySelector('button[type="submit"]');
-                if (btn) { btn.click(); return; }
+        sign_sel = wait_for_any(driver, ['button[type="submit"]'], timeout=5)
+        if sign_sel:
+            driver.click(sign_sel)
+        else:
+            driver.execute_script("""
                 var btns = document.querySelectorAll('button');
                 for (var b of btns) {
-                    if (b.textContent.includes('Sign in')) { b.click(); return; }
+                    if (b.textContent.includes('Sign in')) { b.click(); break; }
                 }
-            }, 1000);
-        """)
+            """)
+        cprint(Fore.GREEN, "OK", "Sign In clicked")
+        monitor_status["status"] = "login:waiting_redirect"
+        time.sleep(5)
 
-        # Disconnect BEFORE the click fires
-        try:
-            driver.disconnect()
-            cprint(Fore.GREEN, "OK", "Disconnected before click")
-        except Exception as e:
-            cprint(Fore.YELLOW, "..", f"disconnect: {str(e)[:40]}")
-
-        # Wait while disconnected — click fires, form submits, CF challenge
-        # happens, redirect completes — all without Selenium connected
-        monitor_status["status"] = "login:disconnected_waiting"
-        time.sleep(12)
-
-        # Reconnect
-        try:
-            driver.reconnect(3)
-            cprint(Fore.GREEN, "OK", "Reconnected")
-        except Exception as e:
-            cprint(Fore.YELLOW, "..", f"reconnect: {str(e)[:40]}")
-            time.sleep(3)
-
-        monitor_status["status"] = "login:checking_result"
-
-        # Dump page info right after reconnect
-        try:
-            url = driver.current_url
-            title = driver.execute_script("return document.title;") or ""
-            body = (driver.execute_script("return document.body.innerText;") or "")[:200]
-            cprint(Fore.CYAN, ">>", f"After reconnect URL: {url[:60]}")
-            cprint(Fore.CYAN, ">>", f"Title: {title}")
-            cprint(Fore.CYAN, ">>", f"Body: {body[:100]}")
-            monitor_status["last_error"] = f"post-reconnect: {title} | {body[:80]}"
-        except Exception as e:
-            cprint(Fore.YELLOW, "..", f"Page read err: {str(e)[:40]}")
-
-        # Check if we landed on dashboard
-        for w in range(15):
+        # Check result and handle CF/Turnstile
+        for w in range(30):
             try:
                 url = driver.current_url
-                cprint(Fore.CYAN, ">>", f"Post-login URL: {url[:60]}") if w == 0 else None
             except Exception:
                 time.sleep(1)
                 continue
 
+            # Success: redirected to cursor.com
             if "cursor.com" in url and "authenticator" not in url:
                 cprint(Fore.GREEN, "OK", f"Login success! {url}")
                 return True
 
-            # If still on CF, try reconnect again
+            if w == 0:
+                title = driver.execute_script("return document.title;") or ""
+                body = (driver.execute_script("return document.body.innerText;") or "")[:150]
+                cprint(Fore.CYAN, ">>", f"After sign-in: {url[:50]} | {title}")
+                cprint(Fore.CYAN, ">>", f"Body: {body[:100]}")
+                monitor_status["last_error"] = f"post-signin: {title} | {body[:80]}"
+
+            # Try to click Turnstile checkbox via iframe
+            if w in (2, 8, 15):
+                try:
+                    frames = driver.find_elements("css selector",
+                        'iframe[src*="turnstile"], iframe[src*="challenges"]')
+                    if frames:
+                        cprint(Fore.YELLOW, "CF", f"Found {len(frames)} CF iframe(s), clicking...")
+                        from selenium.webdriver.common.action_chains import ActionChains
+                        for frame in frames:
+                            try:
+                                ActionChains(driver).move_to_element(frame).click().perform()
+                                time.sleep(2)
+                            except Exception:
+                                pass
+                        # Also try switching into iframe
+                        try:
+                            driver.switch_to.frame(frames[0])
+                            driver.execute_script("""
+                                var cb = document.querySelector('input[type="checkbox"]');
+                                if (cb) cb.click();
+                                var spans = document.querySelectorAll('span');
+                                for (var s of spans) { s.click(); }
+                            """)
+                            driver.switch_to.default_content()
+                            time.sleep(3)
+                        except Exception:
+                            try:
+                                driver.switch_to.default_content()
+                            except Exception:
+                                pass
+                except Exception as e:
+                    cprint(Fore.YELLOW, "..", f"Turnstile click err: {str(e)[:40]}")
+
+            # Check for wrong credentials
             if w == 5:
                 try:
-                    is_cf = driver.execute_script(
-                        "return document.title.includes('Just a moment');"
-                    )
-                    if is_cf:
-                        cprint(Fore.YELLOW, "CF", "Still on CF, reconnecting...")
-                        safe_reconnect(driver, 10)
+                    body = (driver.execute_script("return document.body.innerText;") or "").lower()
+                    if "incorrect" in body or "invalid" in body:
+                        cprint(Fore.RED, "!!", "Wrong credentials!")
+                        monitor_status["last_error"] = "Wrong credentials"
+                        return False
                 except Exception:
                     pass
 
-            # If still stuck at 10s, try direct dashboard nav
-            if w == 10:
+            # At 20s, try direct dashboard nav as fallback
+            if w == 20:
                 monitor_status["status"] = "login:try_direct_nav"
-                cprint(Fore.CYAN, ">>", "Trying direct nav to dashboard...")
+                cprint(Fore.CYAN, ">>", "Trying direct dashboard nav...")
                 try:
-                    driver.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=6)
-                except Exception:
                     driver.get(DASHBOARD_URL)
-                time.sleep(2)
-                solve_cloudflare(driver, "dashboard")
-                try:
+                    time.sleep(3)
                     url = driver.current_url
                     if "cursor.com" in url and "authenticator" not in url:
                         text = driver.execute_script("return document.body.innerText;") or ""
@@ -454,6 +453,7 @@ def login_to_cursor(driver, email, password):
                             return True
                 except Exception:
                     pass
+
             time.sleep(1)
 
         try:
