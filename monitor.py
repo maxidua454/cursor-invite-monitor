@@ -202,7 +202,7 @@ def safe_reconnect(driver, wait=8):
 
 
 def solve_cloudflare(driver, context="page"):
-    for attempt in range(5):
+    for attempt in range(4):
         try:
             is_cf = driver.execute_script("""
                 return document.title.includes('Just a moment')
@@ -215,22 +215,9 @@ def solve_cloudflare(driver, context="page"):
             if not is_cf:
                 return True
 
-            cprint(Fore.YELLOW, "CF", f"{context} (attempt {attempt+1}/5)")
+            cprint(Fore.YELLOW, "CF", f"{context} (attempt {attempt+1}/4)")
 
-            # Method 1: Try uc_gui_click_captcha (clicks Turnstile checkbox)
-            try:
-                driver.uc_gui_click_captcha()
-                time.sleep(3)
-                still = driver.execute_script(
-                    "return document.title.includes('Just a moment');"
-                )
-                if not still:
-                    cprint(Fore.GREEN, "OK", "CF bypassed via uc_gui_click!")
-                    return True
-            except Exception as e:
-                cprint(Fore.YELLOW, "..", f"uc_gui_click: {str(e)[:40]}")
-
-            # Method 2: reconnect trick
+            # Method 1: reconnect trick (disconnect/reconnect bypasses CF)
             safe_reconnect(driver, 8)
             time.sleep(1)
 
@@ -242,6 +229,7 @@ def solve_cloudflare(driver, context="page"):
                 cprint(Fore.GREEN, "OK", "CF bypassed!")
                 return True
 
+            # Check if token was auto-solved
             token = driver.execute_script("""
                 var inp = document.querySelector('input[name="cf-turnstile-response"]');
                 if (inp && inp.value && inp.value.length > 20) return true;
@@ -251,21 +239,7 @@ def solve_cloudflare(driver, context="page"):
                 cprint(Fore.GREEN, "OK", "Turnstile solved!")
                 return True
 
-            # Method 3: Try clicking the iframe checkbox directly
-            try:
-                driver.execute_script("""
-                    var frames = document.querySelectorAll('iframe');
-                    for (var f of frames) {
-                        if (f.src && f.src.includes('turnstile')) {
-                            f.click();
-                        }
-                    }
-                """)
-                time.sleep(2)
-            except Exception:
-                pass
-
-            # Method 4: longer reconnect
+            # Method 2: longer reconnect
             safe_reconnect(driver, 12)
             time.sleep(2)
         except Exception as e:
@@ -397,22 +371,52 @@ def login_to_cursor(driver, email, password):
         cprint(Fore.GREEN, "OK", "Sign In clicked")
         monitor_status["status"] = "login:waiting_redirect"
 
-        time.sleep(2)
-        solve_cloudflare(driver, "post-signin")
+        time.sleep(3)
 
+        # Check if already redirected to dashboard
         try:
-            if "authenticator" in driver.current_url:
-                driver.execute_script("""
-                    var btns = document.querySelectorAll('button');
-                    for (var b of btns) {
-                        if (b.textContent.includes('Sign in')) { b.click(); break; }
-                    }
-                """)
-                time.sleep(2)
+            url = driver.current_url
+            if "cursor.com" in url and "authenticator" not in url:
+                cprint(Fore.GREEN, "OK", f"Login success (redirect)! {url}")
+                return True
         except Exception:
             pass
 
-        for w in range(40):
+        # Try solving post-signin CF
+        solve_cloudflare(driver, "post-signin")
+
+        # Check again after CF
+        try:
+            url = driver.current_url
+            if "cursor.com" in url and "authenticator" not in url:
+                cprint(Fore.GREEN, "OK", f"Login success (post-CF)! {url}")
+                return True
+        except Exception:
+            pass
+
+        # If still on authenticator, try navigating directly to dashboard
+        # The auth cookies may already be set even if CF blocks the redirect
+        monitor_status["status"] = "login:try_direct_nav"
+        cprint(Fore.CYAN, ">>", "Trying direct navigation to dashboard...")
+        try:
+            driver.uc_open_with_reconnect(DASHBOARD_URL, reconnect_time=6)
+        except Exception:
+            driver.get(DASHBOARD_URL)
+        time.sleep(3)
+        solve_cloudflare(driver, "dashboard")
+
+        try:
+            url = driver.current_url
+            if "cursor.com" in url and "authenticator" not in url and "login" not in url:
+                text = driver.execute_script("return document.body.innerText;") or ""
+                if "Team Plan" in text or "Overview" in text or "Settings" in text or "Usage" in text:
+                    cprint(Fore.GREEN, "OK", f"Login success (direct nav)! {url}")
+                    return True
+        except Exception:
+            pass
+
+        # Brief wait loop as fallback
+        for w in range(15):
             try:
                 url = driver.current_url
             except Exception:
@@ -422,25 +426,15 @@ def login_to_cursor(driver, email, password):
                 cprint(Fore.GREEN, "OK", f"Login success! {url}")
                 return True
             if w % 5 == 0 and w > 0:
-                monitor_status["status"] = f"login:wait_{w}s@{url[:30]}"
-                try:
-                    if driver.execute_script("return document.title.includes('Just a moment');"):
-                        safe_reconnect(driver, 6)
-                except Exception:
-                    pass
+                monitor_status["status"] = f"login:wait_{w}s"
             time.sleep(1)
 
         try:
             final_url = driver.current_url
-            src = driver.get_page_source().lower()
             title = driver.execute_script("return document.title;") or ""
-            body_text = (driver.execute_script("return document.body.innerText;") or "")[:300]
+            body_text = (driver.execute_script("return document.body.innerText;") or "")[:200]
             cprint(Fore.RED, "!!", f"Login timeout | URL: {final_url[:60]} | Title: {title}")
-            cprint(Fore.RED, "!!", f"Body preview: {body_text[:150]}")
-            if ("incorrect" in src or "invalid" in src) and "just a moment" not in src:
-                cprint(Fore.RED, "!!", "Wrong credentials detected in page!")
-                monitor_status["last_error"] = f"Wrong credentials | {title}"
-                return False
+            cprint(Fore.RED, "!!", f"Body: {body_text[:150]}")
         except Exception:
             final_url = "unknown"
 
