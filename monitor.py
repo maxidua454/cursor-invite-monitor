@@ -50,6 +50,7 @@ log = logging.getLogger("cursor-monitor")
 DASHBOARD_URL = "https://cursor.com/dashboard"
 MEMBERS_URL = "https://cursor.com/dashboard/members"
 INVITE_LINK_API = "https://cursor.com/api/dashboard/get-team-invite-link"
+ACCEPT_INVITE_API = "https://cursor.com/api/accept-invite"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
@@ -335,45 +336,62 @@ class CursorHTTP:
             return None, "error", ms
 
     def join_with_invite_link(self, invite_link):
-        """Returns (success, detail, response_ms)."""
+        """Accept invite via POST /api/accept-invite. Returns (success, detail, response_ms)."""
         if not invite_link:
             return False, "no_link", 0
+
+        # Extract invite code from URL
+        code = ""
+        m = re.search(r'[?&]code=([a-f0-9]+)', invite_link)
+        if m:
+            code = m.group(1)
+        else:
+            log_event("error", f"Cannot extract invite code from: {invite_link}")
+            return False, "bad_link", 0
+
         t0 = time.time()
         try:
-            # Method 1: GET the invite link (follows redirects)
-            resp = self.session.get(invite_link, timeout=10, allow_redirects=True)
-            ms = int((time.time() - t0) * 1000)
-            final_url = resp.url
-            status = resp.status_code
-
-            log_event("rejoin", f"GET {invite_link} → HTTP {status} → {final_url} ({ms}ms)")
-
-            if status == 200 and ("dashboard" in final_url or "Team Plan" in resp.text[:500]):
-                return True, f"joined_via_get ({ms}ms)", ms
-
-            # Method 2: POST
-            t1 = time.time()
-            resp2 = self.session.post(
-                invite_link,
-                headers={"Content-Type": "application/json", "Accept": "application/json",
-                         "Referer": invite_link, "Origin": "https://cursor.com"},
-                json={},
+            # Primary method: POST /api/accept-invite with inviteCode
+            resp = self.session.post(
+                ACCEPT_INVITE_API,
+                json={"inviteCode": code},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Referer": invite_link,
+                    "Origin": "https://cursor.com",
+                },
                 timeout=10,
             )
-            ms2 = int((time.time() - t1) * 1000)
-            log_event("rejoin", f"POST {invite_link} → HTTP {resp2.status_code} ({ms2}ms)")
-            if resp2.status_code == 200:
-                return True, f"joined_via_post ({ms2}ms)", ms + ms2
+            ms = int((time.time() - t0) * 1000)
 
-            # Method 3: Verify via API
-            t2 = time.time()
-            link, api_status, api_ms = self.get_invite_link_via_api()
-            if link:
-                log_event("rejoin", f"VERIFIED via API — team access restored ({api_ms}ms)")
-                return True, f"confirmed_via_api ({api_ms}ms)", ms + ms2 + api_ms
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    team_id = data.get("teamId", "")
+                    log_event("rejoin", f"ACCEPTED via API! teamId={team_id} ({ms}ms)")
+                    return True, f"accepted ({ms}ms) teamId={team_id}", ms
+                except:
+                    log_event("rejoin", f"ACCEPTED via API (non-JSON response) ({ms}ms)")
+                    return True, f"accepted ({ms}ms)", ms
 
-            total_ms = int((time.time() - t0) * 1000)
-            return False, f"all_methods_failed ({total_ms}ms)", total_ms
+            # Parse error
+            error_detail = ""
+            try:
+                err = resp.json()
+                error_detail = err.get("error", {}).get("details", [{}])[0].get("details", {}).get("detail", "")
+            except:
+                error_detail = resp.text[:200]
+
+            log_event("rejoin", f"FAILED HTTP {resp.status_code}: {error_detail} ({ms}ms)")
+
+            if "expired" in error_detail.lower():
+                return False, f"invite_code_expired ({ms}ms)", ms
+            elif "not found" in error_detail.lower():
+                return False, f"invite_code_not_found ({ms}ms)", ms
+            else:
+                return False, f"http_{resp.status_code}: {error_detail[:80]} ({ms}ms)", ms
+
         except Exception as e:
             ms = int((time.time() - t0) * 1000)
             log_event("error", f"Join error: {str(e)[:60]} ({ms}ms)")
