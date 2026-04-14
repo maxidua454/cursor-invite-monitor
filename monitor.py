@@ -929,8 +929,9 @@ def monitor_account(account, cfg):
                         time.sleep(2)  # 2s after that
 
                 else:
-                    # All 60 attempts failed
-                    log_event("critical", f"REJOIN FAILED after 60 attempts!")
+                    # All 60 attempts failed — link is dead
+                    log_event("critical", f"REJOIN FAILED after 60 attempts! Link is dead.")
+                    dead_link = known_link
                     status["status"] = "REJOIN_FAILED"
                     status["last_error"] = "Rejoin failed after 60 attempts"
                     send_email(cfg, f"REJOIN FAILED - {name}",
@@ -939,6 +940,46 @@ def monitor_account(account, cfg):
                         f"<p>Tried 60 times. The invite link may have been revoked.</p>"
                         f"<p>Link used: {known_link}</p>"
                         f"<p><b>Action needed:</b> Get a new invite link and update KNOWN_INVITE_LINK on Render.</p>")
+
+                    # Wait for new invite link — don't retry dead link forever
+                    log_event("info", "Waiting for new invite link (checking every 30s)...")
+                    while True:
+                        time.sleep(30)
+                        # Check if KNOWN_INVITE_LINK env var was updated
+                        env_link = os.environ.get(f"KNOWN_INVITE_LINK{suffix}", "")
+                        if env_link and env_link != dead_link:
+                            log_event("ok", f"New invite link detected from env: ...{env_link[-30:]}")
+                            known_link = env_link
+                            account["known_invite_link"] = env_link
+                            save_config(cfg)
+                            # Try rejoining with new link immediately
+                            success, detail, join_ms = http.join_with_invite_link(known_link)
+                            if success:
+                                log_event("rejoin", f"REJOINED with new link! {detail}")
+                                status["status"] = "running"
+                                status["rejoins"] = status.get("rejoins", 0) + 1
+                                send_email(cfg, f"REJOINED TEAM - {name}",
+                                    f"<h2 style='color:green'>Rejoined with new invite link!</h2>"
+                                    f"<p>Link: {known_link}</p>")
+                            break
+                        # Also check if new cookies were provided (redeploy)
+                        new_cookies = load_cookies(suffix)
+                        if new_cookies and new_cookies != cookies:
+                            log_event("info", "New cookies detected during wait, restarting...")
+                            cookies = new_cookies
+                            http = CursorHTTP(new_cookies)
+                            # New cookies might mean we're back on team
+                            new_link, api_stat, _ = http.get_invite_link_via_api()
+                            if api_stat == "ok" and new_link:
+                                log_event("ok", f"Back on team! Link: ...{new_link[-30:]}")
+                                known_link = new_link
+                                account["known_invite_link"] = new_link
+                                save_config(cfg)
+                                status["status"] = "running"
+                                status["session_valid"] = True
+                                break
+                            elif api_stat == "unauthorized":
+                                log_event("warn", "Still removed with new cookies, continuing wait...")
 
                 continue
 
