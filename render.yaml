@@ -21,7 +21,7 @@ services:
       - key: SESSION_COOKIES
         sync: false
       - key: ACCOUNT_NAME
-        value: "Adrian Max - Hanwha Team"
+        value: "Adrian Max - Aiston Team"
       - key: KNOWN_INVITE_LINK
         sync: false
       # Account 2 (add more as needed)

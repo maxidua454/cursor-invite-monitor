@@ -3,9 +3,7 @@ __pycache__/
 *.log
 login_error.png
 link_history.json
-test_run.py
-cursor_checker.py
-gui_checker.py
+events.json
 config.json
 cookies.json
 downloaded_files/
