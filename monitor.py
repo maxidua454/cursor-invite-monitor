@@ -162,12 +162,56 @@ def save_config(cfg):
         json.dump(cfg, f, indent=4)
 
 
+def parse_netscape_cookies(text):
+    """Parse Netscape HTTP Cookie File format into {name: value} dict.
+    Format: domain\tinclude_subdomains\tpath\tsecure\texpiry\tname\tvalue
+    Lines starting with # are comments (except #HttpOnly_ prefix).
+    """
+    cookies = {}
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # #HttpOnly_ prefix means httpOnly cookie — strip prefix and parse
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue  # Skip comment lines
+
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            name = parts[5]
+            value = parts[6]
+            cookies[name] = value
+    return cookies
+
+
+def is_netscape_format(text):
+    """Detect if text is Netscape cookie file format."""
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # Netscape lines are tab-separated with 7 fields
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            return True
+        return False
+    return False
+
+
 def normalize_cookies(raw):
-    """Accept both formats:
+    """Accept multiple formats:
     - Cookie-Editor export: [{"name":"x","value":"y",...}, ...]
     - Simple dict: {"name": "value", ...}
+    - Netscape HTTP Cookie File format (string)
     Returns simple {name: value} dict.
     """
+    if isinstance(raw, str):
+        # Try Netscape format
+        if is_netscape_format(raw):
+            return parse_netscape_cookies(raw)
+        return {}
     if isinstance(raw, list):
         # Cookie-Editor / browser extension format
         return {c["name"]: c["value"] for c in raw if "name" in c and "value" in c}
@@ -186,16 +230,32 @@ def load_cookies(suffix=""):
         try:
             raw = json.loads(env_cookies)
             cookies = normalize_cookies(raw)
-            cprint("OK", f"Loaded {len(cookies)} cookies from {env_key}")
+            cprint("OK", f"Loaded {len(cookies)} cookies from {env_key} (JSON)")
             return cookies
         except json.JSONDecodeError:
-            cprint("!!", f"{env_key} env var is not valid JSON")
+            # Try Netscape format
+            if is_netscape_format(env_cookies):
+                cookies = parse_netscape_cookies(env_cookies)
+                if cookies:
+                    cprint("OK", f"Loaded {len(cookies)} cookies from {env_key} (Netscape format)")
+                    return cookies
+            cprint("!!", f"{env_key} env var is not valid JSON or Netscape format")
     if not suffix and COOKIE_PATH.exists():
         with open(COOKIE_PATH, "r") as f:
-            raw = json.load(f)
-        cookies = normalize_cookies(raw)
-        cprint("OK", f"Loaded {len(cookies)} cookies from cookies.json")
-        return cookies
+            content = f.read()
+        # Try JSON first, then Netscape
+        try:
+            raw = json.loads(content)
+            cookies = normalize_cookies(raw)
+            cprint("OK", f"Loaded {len(cookies)} cookies from cookies.json (JSON)")
+            return cookies
+        except json.JSONDecodeError:
+            if is_netscape_format(content):
+                cookies = parse_netscape_cookies(content)
+                if cookies:
+                    cprint("OK", f"Loaded {len(cookies)} cookies from cookies.json (Netscape format)")
+                    return cookies
+            cprint("!!", "cookies.json is not valid JSON or Netscape format")
     if not suffix:
         cprint("!!", "No cookies found!")
     return {}
