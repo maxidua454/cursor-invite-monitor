@@ -918,6 +918,19 @@ def monitor_account(account, cfg):
                             f"<tr><td><b>Method</b></td><td>{detail}</td></tr>"
                             f"<tr><td><b>Link</b></td><td>{known_link}</td></tr>"
                             f"</table>")
+
+                        # Cooldown after rejoin to avoid Cursor rate-limiting
+                        log_event("info", "Post-rejoin cooldown: waiting 10s before resuming checks...")
+                        time.sleep(10)
+                        consecutive_errors = 0
+
+                        # Re-fetch invite link after cooldown to confirm we're back
+                        new_link, api_stat, _ = http.get_invite_link_via_api()
+                        if api_stat == "ok" and new_link:
+                            known_link = new_link
+                            account["known_invite_link"] = new_link
+                            save_config(cfg)
+                            log_event("ok", f"Post-rejoin link confirmed: ...{new_link[-30:]}")
                         break
 
                     # Don't wait between first few attempts — go as fast as possible
@@ -1025,9 +1038,22 @@ def monitor_account(account, cfg):
 
             else:
                 consecutive_errors += 1
-                if consecutive_errors >= 30:
-                    log_event("warn", f"30 consecutive failures, forcing session check")
+                if consecutive_errors == 30:
+                    log_event("warn", f"30 consecutive API failures, forcing session check")
                     last_session_check = 0
+                elif consecutive_errors == 60:
+                    log_event("warn", f"60 consecutive failures — possible rate-limit. Slowing to 5s checks for 2 min...")
+                    for _ in range(24):  # 24 x 5s = 2 minutes cooldown
+                        time.sleep(5)
+                        new_link, api_stat, _ = http.get_invite_link_via_api()
+                        if api_stat == "ok" and new_link:
+                            log_event("ok", f"API recovered after cooldown! Link: ...{new_link[-30:]}")
+                            known_link = new_link
+                            account["known_invite_link"] = new_link
+                            consecutive_errors = 0
+                            break
+                    else:
+                        log_event("warn", "API still failing after 2 min cooldown, resuming normal checks")
                     consecutive_errors = 0
 
             # Periodic status log (every 500 checks)
