@@ -89,12 +89,14 @@ Add `SESSION_COOKIES_2`, `ACCOUNT_NAME_2` (and optionally `KNOWN_INVITE_LINK_2`)
 ## Current Account
 
 - **User:** Adrian Max (`maxadrian321@gmail.com`)
-- **Team:** Aiston (Team ID: `18905505`)
-- **workos_id:** `user_01KFD8FZX10GWJECRFFD9JG0FM`
-- **Session token expires:** ~2026-06-24 (JWT exp: 1777226560)
-- **Current invite link:** `https://cursor.com/team/accept-invite?code=1eed6596a8ad96c8dbd3ecaca0b5db4ee56761463949bdeb`
+- **Team:** Andela AI Engineering Bootcamp (Team ID: `20615206`)
+- **workos_id:** `user_01KMAXT5445YMNZXHW1GJGMZM4`
+- **Session token expires:** ~2027-04-20 (JWT exp: 1779374689)
+- **Current invite link:** `https://cursor.com/team/accept-invite?code=63cf8b2054f1fc011100657b18d4afb723b8cc3438f412ed`
+- **TEAM_ID env var:** `20615206` (set on Render — required because cookie team_id was wrong)
 
-### Previous Team
+### Previous Teams
+- **Team:** Aiston (Team ID: `18905505`) — switched away 2026-05-04
 - **Team:** Hanwha (Team ID: `19393905`) — no longer active, switched to Aiston on 2026-04-14
 
 ---
@@ -237,6 +239,10 @@ Every 1s: POST /api/dashboard/get-team-invite-link with team_id
 6. **`self.valid` flag in CursorHTTP** — gets set to False on 401 but is never checked before API calls. Not a bug — the rejoin and subsequent checks work fine regardless.
 7. **Email alerts working** — confirmed working as of 2026-04-09 (session expiry email received). Uses Gmail SMTP with app password.
 8. **Typical API response time** — ~130-170ms for invite link check, ~150-200ms for rejoin
+9. **Cookie header string format NOT supported** — only JSON array (Cookie-Editor export) and Netscape HTTP Cookie File formats work. Never paste the raw `Cookie: ...` header string as SESSION_COOKIES.
+10. **`team_id` cookie mismatch (REMOVED_NO_LINK on startup)** — if the browser cookie `team_id` shows an old/wrong team (e.g. you switched teams), the monitor checks the wrong team, gets 401, and immediately thinks you were removed. Fix: set `TEAM_ID=<correct_team_id>` as an env var on Render. The monitor will use this override instead of the cookie value. Confirmed fix as of 2026-05-04 for switch from Hanwha (19393905) → Andela AI Engineering (20615206).
+11. **`team_id` cookie doesn't update when switching teams** — even after navigating to a new team's dashboard and re-exporting cookies, the `team_id` cookie may still show the old team ID. Always set `TEAM_ID` env var manually when switching teams instead of relying on the cookie.
+12. **Invite link auto-extracted on startup** — you do NOT need to set `KNOWN_INVITE_LINK` manually. On startup the monitor calls `get-team-invite-link` API with the team_id and extracts it automatically. It only fails if the team_id is wrong (see #10) or the session is expired.
 
 ---
 
