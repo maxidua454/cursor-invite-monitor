@@ -283,6 +283,7 @@ def discover_accounts():
             "known_invite_link": os.environ.get("KNOWN_INVITE_LINK", ""),
             "cookies": cookies,
             "suffix": "",
+            "team_id_override": os.environ.get("TEAM_ID", ""),
             "enabled": True,
         })
 
@@ -296,6 +297,7 @@ def discover_accounts():
                 "known_invite_link": os.environ.get(f"KNOWN_INVITE_LINK{suffix}", ""),
                 "cookies": cookies,
                 "suffix": suffix,
+                "team_id_override": os.environ.get(f"TEAM_ID{suffix}", ""),
                 "enabled": True,
             })
 
@@ -733,6 +735,10 @@ def monitor_account(account, cfg):
     log_event("info", f"[{name}] Monitor starting | {interval}s interval | cookies_env=SESSION_COOKIES{suffix}")
 
     http = CursorHTTP(cookies)
+    team_id_override = account.get("team_id_override", "")
+    if team_id_override:
+        http.team_id = team_id_override
+        log_event("info", f"[{name}] Using TEAM_ID override: {team_id_override}")
 
     # ── INITIAL SESSION CHECK ──
     status["status"] = "checking_session"
