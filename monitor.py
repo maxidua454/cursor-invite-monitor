@@ -329,35 +329,47 @@ class CursorHTTP:
         self.valid = True
 
     def check_session(self):
-        """Returns (valid, detail)."""
-        t0 = time.time()
-        try:
-            resp = self.session.get(DASHBOARD_URL, allow_redirects=False, timeout=10)
-            ms = int((time.time() - t0) * 1000)
-            if resp.status_code in (301, 302, 303, 307, 308):
-                location = resp.headers.get("Location", "")
-                if "authenticator" in location or "login" in location:
+        """Returns (valid, detail).
+        detail='session_expired' = real auth failure (cookies dead).
+        detail='network_error:...' = connectivity issue, session likely still valid.
+        Retries 3x with 5s gap before giving up on network errors.
+        """
+        last_err = ""
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(5)
+            t0 = time.time()
+            try:
+                resp = self.session.get(DASHBOARD_URL, allow_redirects=False, timeout=15)
+                ms = int((time.time() - t0) * 1000)
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("Location", "")
+                    if "authenticator" in location or "login" in location:
+                        self.valid = False
+                        log_event("session", f"EXPIRED — redirect to login ({ms}ms)")
+                        return False, "session_expired"
+                    return True, f"redirect ({ms}ms)"
+                if resp.status_code == 403:
                     self.valid = False
-                    log_event("session", f"EXPIRED — redirect to login ({ms}ms)")
+                    log_event("session", f"EXPIRED — 403 Forbidden ({ms}ms)")
                     return False, "session_expired"
-                return True, f"redirect ({ms}ms)"
-            if resp.status_code == 403:
-                self.valid = False
-                log_event("session", f"403 Forbidden ({ms}ms)")
-                return False, "forbidden"
-            if resp.status_code == 200:
-                text = resp.text
-                if "authenticator" in text and "Sign in" in text:
-                    self.valid = False
-                    log_event("session", f"EXPIRED — login page in body ({ms}ms)")
-                    return False, "session_expired"
-                return True, f"ok ({ms}ms)"
-            log_event("warn", f"Session check unexpected status {resp.status_code} ({ms}ms)")
-            return False, f"status_{resp.status_code}"
-        except Exception as e:
-            ms = int((time.time() - t0) * 1000)
-            log_event("error", f"Session check error: {str(e)[:60]} ({ms}ms)")
-            return False, str(e)[:60]
+                if resp.status_code == 200:
+                    text = resp.text
+                    if "authenticator" in text and "Sign in" in text:
+                        self.valid = False
+                        log_event("session", f"EXPIRED — login page in body ({ms}ms)")
+                        return False, "session_expired"
+                    return True, f"ok ({ms}ms)"
+                # Unexpected HTTP status — could be Render/CDN issue, retry
+                last_err = f"status_{resp.status_code}"
+                log_event("warn", f"Session check attempt {attempt+1}/3: unexpected {resp.status_code} ({ms}ms)")
+            except Exception as e:
+                ms = int((time.time() - t0) * 1000)
+                last_err = str(e)[:80]
+                log_event("warn", f"Session check attempt {attempt+1}/3 failed: {last_err} ({ms}ms)")
+        # All 3 attempts failed — network issue, NOT a real session expiry
+        log_event("error", f"Session check: 3/3 attempts failed (network issue, session likely still valid): {last_err}")
+        return False, f"network_error:{last_err}"
 
     def get_invite_link_via_api(self):
         """Returns (link, status, response_ms). Status: 'ok', 'unauthorized', 'error'."""
@@ -744,33 +756,38 @@ def monitor_account(account, cfg):
     status["status"] = "checking_session"
     valid, detail = http.check_session()
     if not valid:
-        log_event("session", f"Session invalid on start: {detail}")
-        status["status"] = "session_expired"
-        status["session_valid"] = False
-        status["last_error"] = f"Session invalid: {detail}"
-        send_email(cfg, f"SESSION EXPIRED - {name}",
-            "<h2>Session Expired on Start!</h2>"
-            "<p>Your Cursor session cookies are invalid.</p>"
-            "<h3>How to fix:</h3>"
-            "<ol>"
-            "<li>Open <b>cursor.com</b> in your browser and log in</li>"
-            "<li>Use cookie extension (EditThisCookie / Cookie-Editor) → Export as JSON</li>"
-            "<li>Go to Render Dashboard → cursor-invite-monitor → Environment</li>"
-            f"<li>Update <b>SESSION_COOKIES{suffix}</b> env var with the new JSON</li>"
-            "<li>Save → Render auto-redeploys</li>"
-            "</ol>")
-        while True:
-            time.sleep(30)
-            new_cookies = load_cookies(suffix)
-            if new_cookies and new_cookies != cookies:
-                log_event("info", f"[{name}] New cookies detected, retrying...")
-                cookies = new_cookies
-                http = CursorHTTP(cookies)
-                valid, detail = http.check_session()
-                if valid:
-                    log_event("ok", f"[{name}] Session restored!")
-                    status["session_valid"] = True
-                    break
+        if detail.startswith("network_error:"):
+            # Network issue on startup — don't declare expired, assume session is ok and continue
+            log_event("warn", f"Network error on startup session check — assuming session valid, continuing: {detail}")
+            status["session_valid"] = True
+        else:
+            log_event("session", f"Session invalid on start: {detail}")
+            status["status"] = "session_expired"
+            status["session_valid"] = False
+            status["last_error"] = f"Session invalid: {detail}"
+            send_email(cfg, f"SESSION EXPIRED - {name}",
+                "<h2>Session Expired on Start!</h2>"
+                "<p>Your Cursor session cookies are invalid.</p>"
+                "<h3>How to fix:</h3>"
+                "<ol>"
+                "<li>Open <b>cursor.com</b> in your browser and log in</li>"
+                "<li>Use cookie extension (EditThisCookie / Cookie-Editor) → Export as JSON</li>"
+                "<li>Go to Render Dashboard → cursor-invite-monitor → Environment</li>"
+                f"<li>Update <b>SESSION_COOKIES{suffix}</b> env var with the new JSON</li>"
+                "<li>Save → Render auto-redeploys</li>"
+                "</ol>")
+            while True:
+                time.sleep(30)
+                new_cookies = load_cookies(suffix)
+                if new_cookies and new_cookies != cookies:
+                    log_event("info", f"[{name}] New cookies detected, retrying...")
+                    cookies = new_cookies
+                    http = CursorHTTP(cookies)
+                    valid, detail = http.check_session()
+                    if valid:
+                        log_event("ok", f"[{name}] Session restored!")
+                        status["session_valid"] = True
+                        break
     else:
         log_event("ok", f"[{name}] Session valid: {detail}")
         status["session_valid"] = True
@@ -810,37 +827,44 @@ def monitor_account(account, cfg):
                 valid, detail = http.check_session()
                 last_session_check = time.time()
                 if not valid:
-                    log_event("session", f"SESSION EXPIRED: {detail}")
-                    status["status"] = "session_expired"
-                    status["session_valid"] = False
-                    status["last_error"] = f"Session expired: {detail}"
-                    send_email(cfg, f"SESSION EXPIRED - {name}",
-                        "<h2>Session Expired!</h2>"
-                        "<p>Your Cursor session cookies have expired.</p>"
-                        "<h3>How to fix:</h3>"
-                        "<ol>"
-                        "<li>Open <b>cursor.com</b> in browser → log in</li>"
-                        "<li>Cookie extension → Export all cursor.com cookies as JSON</li>"
-                        "<li>Render Dashboard → cursor-invite-monitor → Environment</li>"
-                        f"<li>Update <b>SESSION_COOKIES{suffix}</b> with new JSON → Save</li>"
-                        "</ol>")
-                    while True:
-                        time.sleep(30)
-                        new_cookies = load_cookies(suffix)
-                        if new_cookies and new_cookies != cookies:
-                            log_event("info", f"[{name}] New cookies detected...")
-                            cookies = new_cookies
-                            http = CursorHTTP(new_cookies)
-                            valid, _ = http.check_session()
-                            if valid:
-                                log_event("ok", "Session restored!")
-                                status["session_valid"] = True
-                                status["status"] = "running"
-                                last_session_check = time.time()
-                                send_email(cfg, f"SESSION RESTORED - {name}",
-                                    "<h2>Session Restored!</h2><p>Monitoring resumed.</p>")
-                                break
-                    continue
+                    if detail.startswith("network_error:"):
+                        # Render/network blip — session is likely still valid, keep monitoring
+                        log_event("warn", f"Session check network error (NOT treating as expired, continuing): {detail}")
+                        status["last_error"] = f"Network blip: {detail}"
+                        # Don't change status or enter waiting loop — just continue
+                    else:
+                        # Real auth failure — cookies are dead
+                        log_event("session", f"SESSION EXPIRED: {detail}")
+                        status["status"] = "session_expired"
+                        status["session_valid"] = False
+                        status["last_error"] = f"Session expired: {detail}"
+                        send_email(cfg, f"SESSION EXPIRED - {name}",
+                            "<h2>Session Expired!</h2>"
+                            "<p>Your Cursor session cookies have expired.</p>"
+                            "<h3>How to fix:</h3>"
+                            "<ol>"
+                            "<li>Open <b>cursor.com</b> in browser → log in</li>"
+                            "<li>Cookie extension → Export all cursor.com cookies as JSON</li>"
+                            "<li>Render Dashboard → cursor-invite-monitor → Environment</li>"
+                            f"<li>Update <b>SESSION_COOKIES{suffix}</b> with new JSON → Save</li>"
+                            "</ol>")
+                        while True:
+                            time.sleep(30)
+                            new_cookies = load_cookies(suffix)
+                            if new_cookies and new_cookies != cookies:
+                                log_event("info", f"[{name}] New cookies detected...")
+                                cookies = new_cookies
+                                http = CursorHTTP(new_cookies)
+                                valid, detail2 = http.check_session()
+                                if valid:
+                                    log_event("ok", "Session restored!")
+                                    status["session_valid"] = True
+                                    status["status"] = "running"
+                                    last_session_check = time.time()
+                                    send_email(cfg, f"SESSION RESTORED - {name}",
+                                        "<h2>Session Restored!</h2><p>Monitoring resumed.</p>")
+                                    break
+                        continue
 
             # ── PRIMARY CHECK: GET INVITE LINK VIA API ──
             new_link, api_status, api_ms = http.get_invite_link_via_api()
