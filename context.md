@@ -1,6 +1,6 @@
 # Cursor Invite Link Monitor — Full Context
 
-**Last updated:** 2026-04-14
+**Last updated:** 2026-05-04
 
 ## What This Project Does
 
@@ -73,8 +73,9 @@ Automatically monitors a Cursor.com team and **instantly rejoins** if you get re
 ### Environment Variables on Render
 | Variable | Description | Current Value |
 |---|---|---|
-| `SESSION_COOKIES` | Account 1 cookies (JSON or Netscape) | Set (user_01KFD8FZX10GWJECRFFD9JG0FM) |
-| `ACCOUNT_NAME` | Display name for account 1 | `Adrian Max - Aiston Team` |
+| `SESSION_COOKIES` | Account 1 cookies (JSON or Netscape) | Set (user_01KMAXT5445YMNZXHW1GJGMZM4) |
+| `ACCOUNT_NAME` | Display name for account 1 | `Adrian Max - Andela AI Engineering` |
+| `TEAM_ID` | Override team_id from cookie | `20615206` |
 | `CHECK_INTERVAL` | Seconds between checks | `1` |
 | `NOTIFICATION_EMAIL` | Email for alerts | `maxadrian321@gmail.com` |
 | `GMAIL_APP_PASSWORD` | Gmail app password for SMTP | Set (working — emails confirmed) |
@@ -209,7 +210,7 @@ Every 1s: POST /api/dashboard/get-team-invite-link with team_id
 - **Repo:** https://github.com/maxidua454/cursor-invite-monitor
 - **User:** maxidua454
 - **Branch:** master (only branch)
-- **Latest commit:** `c7f16da` — Cleanup: remove obsolete files, add context.md, update team name
+- **Latest commit:** `43845f1` — Update context.md: new team, cookie troubleshooting notes
 
 ---
 
